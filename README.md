@@ -46,12 +46,17 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   systemd/udev por bus/slot PCI).
 - Actualizacion de `/etc/hosts`, generacion de **llaves SSH** y copia hacia
   el nodo `master`.
-- Cliente **NFS** y montaje del recurso compartido (por defecto `/cluster`),
-  con arranque automatico via `rpcbind`/`remote-fs.target`, la opcion de
-  registrar automaticamente el nodo en `/etc/exports` del maestro via SSH, y
-  la opcion de montar por **NFS/RDMA** (puerto 20049, con `xprtrdma` en el
-  cliente y `svcrdma` + `echo rdma 20049 > /proc/fs/nfsd/portlist` en el
-  maestro) en vez de TCP/IPoIB normal.
+- Cliente **NFS** y montaje del recurso compartido (por defecto
+  `/home/<usuario>/cluster`, la misma ruta en el maestro y en cada nodo),
+  con arranque automatico via `rpcbind`/`remote-fs.target`, verificacion
+  previa con `showmount -e` (confirma que el maestro realmente esta
+  exportando esa ruta antes de intentar montar, en vez de fallar a ciegas),
+  la opcion de registrar automaticamente el nodo en `/etc/exports` del
+  maestro via SSH (con `sync` por defecto o `async` si se prefiere
+  velocidad sobre seguridad ante una caida del maestro), y la opcion de
+  montar por **NFS/RDMA** (puerto 20049, con `xprtrdma` en el cliente y
+  `svcrdma` + `echo rdma 20049 > /proc/fs/nfsd/portlist` **solo en el
+  maestro**, que es el unico que corre `nfsd`) en vez de TCP/IPoIB normal.
 - **Directorio compartido del cluster** (dentro del propio NFS, en
   `cluster-conf/`): fusiona `/etc/hosts` y `authorized_keys` de todos los
   nodos que han pasado por el script, incluyendo el auto-registro de este

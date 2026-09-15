@@ -39,7 +39,7 @@
 #  11) Interfaz IPoIB (ib0) con IP estatica
 #  12) /etc/hosts del cluster
 #  13) Llaves SSH hacia/desde el nodo master
-#  14) Cliente NFS + montaje de /cluster (con arranque automatico via
+#  14) Cliente NFS + montaje de la carpeta compartida (con arranque automatico via
 #      rpcbind/remote-fs.target)
 #  14b) Directorio compartido del cluster (en el propio NFS): fusiona
 #      /etc/hosts y authorized_keys de todos los nodos, incluyendo el
@@ -66,7 +66,8 @@ MANIFEST_FILE="${STATE_DIR}/manifest.log"
 
 CLUSTER_USER="ryzen"
 CLUSTER_GROUP="ryzen"
-SHARED_MOUNT_POINT="/cluster"
+# SHARED_MOUNT_POINT se calcula en gather_input a partir de CLUSTER_USER
+# (ruta real de produccion: /home/<usuario>/cluster), no es un valor fijo.
 # Valor por defecto; se pregunta en gather_input porque DEBE coincidir con
 # la mascara que ya usan los demas nodos (una referencia real de este mismo
 # cluster mostro 255.255.0.0 = /16, no /24 -- confirma cual es la correcta).
@@ -455,18 +456,25 @@ gather_input() {
     done
 
     echo
-    echo -e "${COLOR_BOLD}--- Recursos remotos ---${COLOR_RESET}"
-    NFS_EXPORT_PATH="$(ask "Ruta exportada por NFS en el maestro" "${SHARED_MOUNT_POINT}")"
-    NFS_MOUNT_POINT="$(ask "Punto de montaje local para esa carpeta compartida" "${SHARED_MOUNT_POINT}")"
-
-    DO_NFS_RDMA=false
-    info "NFS sobre RDMA (en vez de TCP/IPoIB normal) da menor latencia, pero requiere que el maestro tenga el modulo 'svcrdma' cargado y 'echo rdma 20049 > /proc/fs/nfsd/portlist' ejecutado despues de levantar nfsd."
-    confirm "¿Montar el recurso NFS usando RDMA (puerto 20049)?" "n" && DO_NFS_RDMA=true
-
-    echo
     echo -e "${COLOR_BOLD}--- Cuenta de trabajo ---${COLOR_RESET}"
     CLUSTER_USER="$(ask "Usuario estandar del cluster" "${CLUSTER_USER}")"
     CLUSTER_GROUP="$(ask "Grupo estandar del cluster" "${CLUSTER_GROUP}")"
+
+    echo
+    echo -e "${COLOR_BOLD}--- Recursos remotos ---${COLOR_RESET}"
+    # Ruta real en produccion: /home/<usuario>/cluster en el maestro,
+    # montada en la misma ruta en cada nodo (no un "/cluster" generico).
+    SHARED_MOUNT_POINT="/home/${CLUSTER_USER}/cluster"
+    NFS_EXPORT_PATH="$(ask "Ruta exportada por NFS en el maestro" "${SHARED_MOUNT_POINT}")"
+    NFS_MOUNT_POINT="$(ask "Punto de montaje local para esa carpeta compartida" "${NFS_EXPORT_PATH}")"
+
+    DO_NFS_RDMA=false
+    info "NFS sobre RDMA (en vez de TCP/IPoIB normal) da menor latencia, pero requiere que el maestro tenga el modulo 'svcrdma' cargado y 'echo rdma 20049 > /proc/fs/nfsd/portlist' ejecutado despues de levantar nfsd. Eso SOLO se hace en el maestro (que corre nfsd); un nodo cliente nunca necesita ejecutarlo."
+    confirm "¿Montar el recurso NFS usando RDMA (puerto 20049)?" "n" && DO_NFS_RDMA=true
+
+    DO_NFS_ASYNC=false
+    info "El export de NFS en el maestro puede ser 'sync' (por defecto, mas seguro: el servidor solo confirma una escritura cuando ya esta en disco) o 'async' (mas rapido, sobre todo con muchas escrituras pequenas, pero si el maestro se cae o pierde energia justo despues de 'confirmar' una escritura que todavia no llego a disco, esos datos se pierden o corrompen silenciosamente). La velocidad de RDMA/InfiniBand no cambia este riesgo: es un tema del disco del maestro, no de la red."
+    confirm "¿Usar 'async' en el export del maestro en vez de 'sync' (mas rapido, con ese riesgo)?" "n" && DO_NFS_ASYNC=true
 
     echo
     echo -e "${COLOR_BOLD}--- Opciones ---${COLOR_RESET}"
@@ -510,6 +518,7 @@ gather_input() {
   Mascara InfiniBand:    /${IB_NETMASK_CIDR}
   NFS remoto:            ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT}
   NFS sobre RDMA:        ${DO_NFS_RDMA}
+  Export NFS async:      ${DO_NFS_ASYNC} (sync=mas seguro, async=mas rapido con riesgo de perdida de datos)
   Usuario/grupo cluster: ${CLUSTER_USER}:${CLUSTER_GROUP}
   apt upgrade:           ${DO_APT_UPGRADE}
   Mitigaciones Ryzen:    ${DO_RYZEN_CSTATE_FIX}
@@ -1185,7 +1194,7 @@ stage_ssh_keys() {
 }
 
 # ============================================================================
-# 13. Cliente NFS + montaje de /cluster
+# 13. Cliente NFS + montaje de la carpeta compartida
 # ============================================================================
 
 stage_nfs_client() {
@@ -1224,6 +1233,27 @@ stage_nfs_client() {
         ok "Entrada agregada a /etc/fstab."
     else
         info "Ya existe una entrada de fstab para ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH}."
+    fi
+
+    # Verificacion previa: preguntar al maestro que esta exportando de
+    # verdad, en vez de intentar montar a ciegas y adivinar por que fallo.
+    # Esto solo puede hacerse aqui (no antes, en gather_input) porque
+    # requiere que la red InfiniBand ya este arriba (etapa anterior).
+    info "Verificando en el maestro (${MASTER_IB_IP}) que este exportando ${NFS_EXPORT_PATH}..."
+    if command -v showmount >/dev/null 2>&1; then
+        local exports_list
+        exports_list="$(timeout 10 showmount -e "${MASTER_IB_IP}" 2>/dev/null)"
+        if [[ -z "${exports_list}" ]]; then
+            warn "No se pudo consultar los exports del maestro via 'showmount -e ${MASTER_IB_IP}'. Puede ser que la red InfiniBand todavia no este arriba en este nodo, o que el maestro no tenga nfs-kernel-server corriendo."
+        elif echo "${exports_list}" | grep -qF "${NFS_EXPORT_PATH}"; then
+            ok "El maestro confirma que exporta ${NFS_EXPORT_PATH}."
+        else
+            warn "El maestro respondio pero NO esta exportando '${NFS_EXPORT_PATH}' todavia. Esto es lo que exporta ahora:"
+            echo "${exports_list}" | tee -a "${LOG_FILE}"
+            warn "Revisa/corrige la ruta en el maestro (/etc/exports) o en este nodo antes de continuar; el intento de montaje que sigue probablemente fallara."
+        fi
+    else
+        warn "'showmount' no esta disponible (deberia venir con nfs-common); se omite la verificacion previa."
     fi
 
     systemctl daemon-reload
@@ -1324,6 +1354,9 @@ stage_cluster_registry() {
 stage_remote_exports() {
     step "Registrando este nodo en /etc/exports del maestro (opcional)"
 
+    local nfs_export_mode="sync"
+    [[ "${DO_NFS_ASYNC}" == true ]] && nfs_export_mode="async"
+
     if [[ "${DO_REMOTE_EXPORTS}" != true || "${SSH_TRUST_OK}" != true ]]; then
         if [[ "${DO_REMOTE_EXPORTS}" == true ]]; then
             warn "No se pudo confirmar que la llave SSH quedo instalada en el maestro; se omite el ajuste automatico de /etc/exports."
@@ -1334,7 +1367,7 @@ stage_remote_exports() {
 Para dar acceso manualmente, en el nodo MAESTRO agrega una linea como esta
 a /etc/exports y luego ejecuta 'sudo exportfs -ra':
 
-  ${NFS_EXPORT_PATH}  ${NODE_IB_IP}(rw,sync,no_subtree_check,no_root_squash)
+  ${NFS_EXPORT_PATH}  ${NODE_IB_IP}(rw,${nfs_export_mode},no_subtree_check,no_root_squash)
 
 EOF
         if [[ "${DO_NFS_RDMA}" == true ]]; then
@@ -1352,7 +1385,7 @@ EOF
         return 0
     fi
 
-    local export_line="${NFS_EXPORT_PATH} ${NODE_IB_IP}(rw,sync,no_subtree_check,no_root_squash)"
+    local export_line="${NFS_EXPORT_PATH} ${NODE_IB_IP}(rw,${nfs_export_mode},no_subtree_check,no_root_squash)"
     local remote_cmd="grep -qF '${NODE_IB_IP}' /etc/exports 2>/dev/null || echo '${export_line}' | sudo tee -a /etc/exports >/dev/null; sudo exportfs -ra"
 
     if sudo -u "${CLUSTER_USER}" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${CLUSTER_USER}@${MASTER_IB_IP}" "${remote_cmd}" 2>&1 | tee -a "${LOG_FILE}"; then
