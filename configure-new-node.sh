@@ -25,14 +25,21 @@
 #   8) Limites de memoria (memlock, nofile) para RDMA
 #   9) Paquetes RDMA/InfiniBand + modulos mlx5 (se detiene y espera input del
 #      usuario si no detecta fisicamente la tarjeta)
-#  10) Bibliotecas HPC desde paquetes descargados (UCX/libfabric/LibXC/OpenMPI)
+#  10) Bibliotecas HPC desde paquetes descargados (UCX/libfabric/LibXC/OpenMPI),
+#      todas en el MISMO prefijo (configurable) que los demas nodos
 #  11) Interfaz IPoIB (ib0) con IP estatica
 #  12) /etc/hosts del cluster
 #  13) Llaves SSH hacia/desde el nodo master
-#  14) Cliente NFS + montaje de /cluster
+#  14) Cliente NFS + montaje de /cluster (con arranque automatico via
+#      rpcbind/remote-fs.target)
+#  14b) Directorio compartido del cluster (en el propio NFS): fusiona
+#      /etc/hosts y authorized_keys de todos los nodos, incluyendo el
+#      auto-registro de este mismo nodo
 #  15) (Opcional) registrar el nodo en /etc/exports del master via SSH
 #  16) Toolchain MPI/OpenMP (OpenMPI + UCX + build-essential)
-#  17) Resumen final
+#  17) Variables de entorno en ~/.bashrc (interactivo Y no interactivo, para
+#      que mpirun via SSH tambien las vea; incluye MKL y afinidad Threadripper)
+#  18) Resumen final
 #
 set -uo pipefail
 
@@ -65,11 +72,17 @@ IB_IFACE=""
 IB_CARD_PRESENT=true
 DOWNLOADS_DIR=""
 DO_CHECK_DOWNLOADS=false
-HPC_STACK_PREFIX="/opt/hpc-stack"
-UCX_PREFIX=""
-LIBFABRIC_PREFIX=""
-LIBXC_PREFIX=""
+# Prefijo de instalacion para UCX/libfabric/LibXC/OpenMPI compilados desde
+# fuente. DEBE ser el mismo en todos los nodos del cluster; /usr/local es la
+# ruta por defecto que usan las bibliotecas cuando se compilan con
+# "./configure" sin --prefix, que es como suelen quedar instaladas en los
+# nodos existentes.
+HPC_INSTALL_PREFIX="/usr/local"
+UCX_BUILT_FROM_SOURCE=false
+LIBFABRIC_BUILT_FROM_SOURCE=false
+LIBXC_BUILT_FROM_SOURCE=false
 OPENMPI_BUILT_FROM_SOURCE=false
+DO_PCIE_ACS_OVERRIDE=false
 
 log() {
     local msg="$1"
@@ -268,6 +281,55 @@ build_from_source() {
     return "${status}"
 }
 
+inject_bashrc_block() {
+    # inject_bashrc_block <archivo_bashrc> <contenido>
+    #
+    # Inserta <contenido> AL PRINCIPIO de <archivo_bashrc>, antes de
+    # cualquier otra linea existente. Esto es a proposito: el .bashrc por
+    # defecto de Debian/Ubuntu empieza con un guardian tipo
+    #   case $- in *i*) ;; *) return;; esac
+    # que corta la ejecucion para shells NO interactivas. Cuando OpenMPI
+    # lanza procesos remotos via "ssh nodo comando", esa shell remota es no
+    # interactiva y NUNCA llega a leer nada que este despues de ese
+    # guardian. Poniendo nuestras variables ANTES de ese punto, tanto las
+    # sesiones interactivas (terminal) como las no interactivas (mpirun via
+    # ssh) las heredan por igual.
+    #
+    # Es idempotente: si ya existe un bloque marcado, lo reemplaza en el
+    # mismo lugar en vez de duplicarlo.
+    local bashrc_file="$1"
+    local content="$2"
+    local marker_start="# >>> hpc-cluster-new-nodes-script (bloque generado automaticamente; no borrar) >>>"
+    local marker_end="# <<< hpc-cluster-new-nodes-script <<<"
+
+    touch "${bashrc_file}"
+
+    local rest_file
+    rest_file="$(mktemp)"
+    if grep -qF "${marker_start}" "${bashrc_file}"; then
+        awk -v start="${marker_start}" -v end="${marker_end}" '
+            $0==start {skip=1; next}
+            $0==end   {skip=0; next}
+            !skip {print}
+        ' "${bashrc_file}" > "${rest_file}"
+    else
+        cp "${bashrc_file}" "${rest_file}"
+    fi
+
+    local new_file
+    new_file="$(mktemp)"
+    {
+        echo "${marker_start}"
+        echo "${content}"
+        echo "${marker_end}"
+        echo
+        cat "${rest_file}"
+    } > "${new_file}"
+
+    mv "${new_file}" "${bashrc_file}"
+    rm -f "${rest_file}"
+}
+
 trap 'err "Interrumpido por el usuario (Ctrl+C)."; exit 130' INT
 
 # ============================================================================
@@ -340,7 +402,11 @@ gather_input() {
     confirm "¿Actualizar todos los paquetes del sistema (apt upgrade) antes de continuar?" "s" && DO_APT_UPGRADE=true
 
     DO_RYZEN_CSTATE_FIX=false
-    confirm "¿Aplicar mitigaciones de estabilidad para congelamientos tipicos de plataformas AMD Ryzen (C-states/gobernador de CPU)?" "s" && DO_RYZEN_CSTATE_FIX=true
+    confirm "¿Aplicar mitigaciones de estabilidad para congelamientos tipicos de plataformas AMD Ryzen/Threadripper (1950X/2990WX): C-states/gobernador de CPU?" "s" && DO_RYZEN_CSTATE_FIX=true
+
+    DO_PCIE_ACS_OVERRIDE=false
+    info "En plataformas Threadripper (2990WX/1950X) el ACS de PCIe suele forzar todo el trafico peer-to-peer (tarjetas InfiniBand, GPUs) a pasar por el root complex del CPU, con mas latencia. El parametro de kernel 'pcie_acs_override=downstream,multifunction' es el workaround documentado por la comunidad para evitarlo. Tiene una contrapartida: relaja el aislamiento IOMMU entre dispositivos (relevante solo si usas paso de PCI a maquinas virtuales)."
+    confirm "¿Aplicar 'pcie_acs_override=downstream,multifunction' para mejorar el trafico peer-to-peer en Threadripper?" "s" && DO_PCIE_ACS_OVERRIDE=true
 
     DO_SSH_COPY_TO_MASTER=false
     confirm "¿Intentar copiar la llave SSH de este nodo al maestro ahora (te pedira la contrasena del usuario ${CLUSTER_USER} en ${MASTER_HOSTNAME})?" "s" && DO_SSH_COPY_TO_MASTER=true
@@ -360,6 +426,7 @@ gather_input() {
     confirm "¿Buscar esos paquetes descargados y ofrecer compilarlos?" "s" && DO_CHECK_DOWNLOADS=true
     if [[ "${DO_CHECK_DOWNLOADS}" == true ]]; then
         DOWNLOADS_DIR="$(ask "Carpeta donde estan los paquetes descargados" "/home/${CLUSTER_USER}/Descargas")"
+        HPC_INSTALL_PREFIX="$(ask "Prefijo de instalacion para UCX/libfabric/LibXC/OpenMPI (debe ser EXACTAMENTE el mismo en todos los nodos del cluster; usa la misma ruta por defecto que ya usan los nodos existentes)" "${HPC_INSTALL_PREFIX}")"
     fi
 
     echo
@@ -372,10 +439,11 @@ gather_input() {
   Usuario/grupo cluster: ${CLUSTER_USER}:${CLUSTER_GROUP}
   apt upgrade:           ${DO_APT_UPGRADE}
   Mitigaciones Ryzen:    ${DO_RYZEN_CSTATE_FIX}
+  PCIe ACS override:     ${DO_PCIE_ACS_OVERRIDE}
   Copiar llave a master: ${DO_SSH_COPY_TO_MASTER}
   Editar exports remoto: ${DO_REMOTE_EXPORTS}
   Montar NFS:            ${DO_MOUNT_NFS}
-  Buscar libs descargadas: ${DO_CHECK_DOWNLOADS} ${DOWNLOADS_DIR:+(${DOWNLOADS_DIR})}
+  Buscar libs descargadas: ${DO_CHECK_DOWNLOADS} ${DOWNLOADS_DIR:+(${DOWNLOADS_DIR}, prefix=${HPC_INSTALL_PREFIX})}
 EOF
     echo
     confirm "¿Continuar con esta configuracion?" "s" || { info "Cancelado por el usuario."; exit 0; }
@@ -588,7 +656,7 @@ EOF
 stage_cpu_stability() {
     step "Configurando gobernador de CPU y estados C para estabilidad"
 
-    pkg_install linux-tools-common "linux-tools-$(uname -r)" cpufrequtils
+    pkg_install linux-tools-common "linux-tools-$(uname -r)" cpufrequtils numactl hwloc-nox
 
     cat > /usr/local/sbin/hpc-set-cpu-performance.sh <<'EOF'
 #!/usr/bin/env bash
@@ -617,23 +685,49 @@ EOF
     systemctl enable --now hpc-cpu-performance.service 2>&1 | tee -a "${LOG_FILE}"
     ok "Gobernador de CPU fijado en 'performance' (persistente via systemd)."
 
-    if [[ "${DO_RYZEN_CSTATE_FIX}" == true ]]; then
+    if [[ "${DO_RYZEN_CSTATE_FIX}" == true || "${DO_PCIE_ACS_OVERRIDE}" == true ]]; then
         if [[ -f /etc/default/grub ]]; then
             backup_file /etc/default/grub
-            local extra_params="processor.max_cstate=1 idle=nomwait"
+            local extra_params=""
+            [[ "${DO_RYZEN_CSTATE_FIX}" == true ]] && extra_params="processor.max_cstate=1 idle=nomwait"
+            if [[ "${DO_PCIE_ACS_OVERRIDE}" == true ]]; then
+                extra_params="${extra_params}${extra_params:+ }pcie_acs_override=downstream,multifunction"
+            fi
             if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
-                if ! grep -q "processor.max_cstate=1" /etc/default/grub; then
-                    sed -i -E "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"(.*)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${extra_params}\"|" /etc/default/grub
-                fi
+                for param in ${extra_params}; do
+                    local param_name="${param%%=*}"
+                    if ! grep -q "${param_name}" /etc/default/grub; then
+                        sed -i -E "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"(.*)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${param}\"|" /etc/default/grub
+                    fi
+                done
             else
                 echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${extra_params}\"" >> /etc/default/grub
             fi
             update-grub 2>&1 | tee -a "${LOG_FILE}" || warn "update-grub fallo; revisa /etc/default/grub manualmente."
-            ok "Parametros de kernel 'processor.max_cstate=1 idle=nomwait' agregados (requieren reinicio)."
-            warn "Estos parametros son un workaround conocido para congelamientos por estados C profundos en plataformas AMD Ryzen. Si el problema persiste, revisa tambien en la BIOS: 'Global C-State Control' / 'Core C6 State' -> Disabled, y actualiza el firmware/BIOS de la board."
+            ok "Parametros de kernel agregados a GRUB: ${extra_params} (requieren reinicio)."
+            if [[ "${DO_RYZEN_CSTATE_FIX}" == true ]]; then
+                warn "'processor.max_cstate=1 idle=nomwait' es un workaround conocido para congelamientos por estados C profundos en plataformas AMD Ryzen/Threadripper. Si el problema persiste, revisa tambien en la BIOS: 'Global C-State Control' / 'Core C6 State' -> Disabled, y actualiza el firmware/BIOS de la board."
+            fi
+            if [[ "${DO_PCIE_ACS_OVERRIDE}" == true ]]; then
+                warn "'pcie_acs_override=downstream,multifunction' mejora el trafico peer-to-peer (InfiniBand/GPUs) en Threadripper, a costa de relajar el aislamiento IOMMU entre dispositivos."
+            fi
         else
             warn "No se encontro /etc/default/grub (¿este sistema no usa GRUB?). Omite el ajuste de parametros de kernel."
         fi
+    fi
+
+    # Topologia NUMA/CCX: en el 2990WX (4 dies, solo 2 con memoria conectada
+    # directamente) y, en menor medida, en el 1950X, el rendimiento y la
+    # estabilidad de MPI/OpenMP mejoran mucho si los hilos se atan a nucleos
+    # cercanos a la memoria que usan. 'numactl --hardware' / 'lstopo' (de
+    # hwloc) sirven para verificar la topologia real; los ajustes de
+    # afinidad correspondientes se dejan declarados en ~/.bashrc del usuario
+    # del cluster (etapa de variables de entorno, mas adelante). En la BIOS
+    # del 2990WX conviene ademas revisar 'NUMA nodes per socket' = 4 (Die)
+    # para que el sistema operativo vea la topologia real de memoria.
+    if command -v numactl >/dev/null 2>&1; then
+        info "Topologia NUMA detectada:"
+        numactl --hardware 2>&1 | tee -a "${LOG_FILE}"
     fi
 
     # Reducir el uso de swap para minimizar pausas por intercambio de memoria
@@ -782,15 +876,16 @@ stage_custom_hpc_libraries() {
         return 0
     fi
     info "Buscando paquetes en: ${downloads_dir}"
+    info "Todo se instalara en el mismo prefijo (${HPC_INSTALL_PREFIX}) para que coincida con la ruta usada en los demas nodos del cluster."
 
     pkg_install build-essential gfortran automake autoconf libtool pkg-config cmake
 
     local ucx_tar
     ucx_tar="$(find_downloaded_archive "${downloads_dir}" "ucx")"
-    if [[ -n "${ucx_tar}" ]] && confirm "Se encontro '$(basename "${ucx_tar}")'. ¿Compilarlo e instalarlo en vez del UCX del repositorio?" "s"; then
-        if build_from_source "UCX" "${ucx_tar}" "${HPC_STACK_PREFIX}/ucx" --with-verbs; then
-            UCX_PREFIX="${HPC_STACK_PREFIX}/ucx"
-            ok "UCX compilado e instalado en ${UCX_PREFIX}."
+    if [[ -n "${ucx_tar}" ]] && confirm "Se encontro '$(basename "${ucx_tar}")'. ¿Compilarlo e instalarlo en ${HPC_INSTALL_PREFIX} en vez del UCX del repositorio?" "s"; then
+        if build_from_source "UCX" "${ucx_tar}" "${HPC_INSTALL_PREFIX}" --with-verbs; then
+            UCX_BUILT_FROM_SOURCE=true
+            ok "UCX compilado e instalado en ${HPC_INSTALL_PREFIX}."
         else
             warn "Fallo la compilacion de UCX; se usara el paquete del repositorio para OpenMPI."
         fi
@@ -798,10 +893,10 @@ stage_custom_hpc_libraries() {
 
     local ofi_tar
     ofi_tar="$(find_downloaded_archive "${downloads_dir}" "libfabric")"
-    if [[ -n "${ofi_tar}" ]] && confirm "Se encontro '$(basename "${ofi_tar}")'. ¿Compilarlo e instalarlo (proveedor OFI/libfabric alternativo para OpenMPI)?" "s"; then
-        if build_from_source "libfabric" "${ofi_tar}" "${HPC_STACK_PREFIX}/libfabric" --enable-verbs; then
-            LIBFABRIC_PREFIX="${HPC_STACK_PREFIX}/libfabric"
-            ok "libfabric compilado e instalado en ${LIBFABRIC_PREFIX}."
+    if [[ -n "${ofi_tar}" ]] && confirm "Se encontro '$(basename "${ofi_tar}")'. ¿Compilarlo e instalarlo en ${HPC_INSTALL_PREFIX} (proveedor OFI/libfabric alternativo para OpenMPI)?" "s"; then
+        if build_from_source "libfabric" "${ofi_tar}" "${HPC_INSTALL_PREFIX}" --enable-verbs; then
+            LIBFABRIC_BUILT_FROM_SOURCE=true
+            ok "libfabric compilado e instalado en ${HPC_INSTALL_PREFIX}."
         else
             warn "Fallo la compilacion de libfabric; se omite (OpenMPI seguira usando UCX/verbs)."
         fi
@@ -809,10 +904,10 @@ stage_custom_hpc_libraries() {
 
     local libxc_tar
     libxc_tar="$(find_downloaded_archive "${downloads_dir}" "libxc")"
-    if [[ -n "${libxc_tar}" ]] && confirm "Se encontro '$(basename "${libxc_tar}")'. ¿Compilarlo e instalarlo (lo usara luego Quantum ESPRESSO)?" "s"; then
-        if build_from_source "LibXC" "${libxc_tar}" "${HPC_STACK_PREFIX}/libxc"; then
-            LIBXC_PREFIX="${HPC_STACK_PREFIX}/libxc"
-            ok "LibXC compilado e instalado en ${LIBXC_PREFIX}."
+    if [[ -n "${libxc_tar}" ]] && confirm "Se encontro '$(basename "${libxc_tar}")'. ¿Compilarlo e instalarlo en ${HPC_INSTALL_PREFIX} (lo usara luego Quantum ESPRESSO)?" "s"; then
+        if build_from_source "LibXC" "${libxc_tar}" "${HPC_INSTALL_PREFIX}"; then
+            LIBXC_BUILT_FROM_SOURCE=true
+            ok "LibXC compilado e instalado en ${HPC_INSTALL_PREFIX}."
         else
             warn "Fallo la compilacion de LibXC; se puede instalar mas adelante junto con Quantum ESPRESSO."
         fi
@@ -820,37 +915,27 @@ stage_custom_hpc_libraries() {
 
     local ompi_tar
     ompi_tar="$(find_downloaded_archive "${downloads_dir}" "openmpi")"
-    if [[ -n "${ompi_tar}" ]] && confirm "Se encontro '$(basename "${ompi_tar}")'. ¿Compilarlo e instalarlo usando el UCX/libfabric recien compilados (recomendado para InfiniBand)?" "s"; then
+    if [[ -n "${ompi_tar}" ]] && confirm "Se encontro '$(basename "${ompi_tar}")'. ¿Compilarlo e instalarlo en ${HPC_INSTALL_PREFIX} usando el UCX/libfabric recien compilados (recomendado para InfiniBand)?" "s"; then
         local ompi_args=(--with-verbs)
-        [[ -n "${UCX_PREFIX}" ]] && ompi_args+=(--with-ucx="${UCX_PREFIX}")
-        [[ -n "${LIBFABRIC_PREFIX}" ]] && ompi_args+=(--with-ofi="${LIBFABRIC_PREFIX}")
-        if build_from_source "OpenMPI" "${ompi_tar}" "${HPC_STACK_PREFIX}/openmpi" "${ompi_args[@]}"; then
+        [[ "${UCX_BUILT_FROM_SOURCE}" == true ]] && ompi_args+=(--with-ucx="${HPC_INSTALL_PREFIX}")
+        [[ "${LIBFABRIC_BUILT_FROM_SOURCE}" == true ]] && ompi_args+=(--with-ofi="${HPC_INSTALL_PREFIX}")
+        if build_from_source "OpenMPI" "${ompi_tar}" "${HPC_INSTALL_PREFIX}" "${ompi_args[@]}"; then
             OPENMPI_BUILT_FROM_SOURCE=true
-            ok "OpenMPI compilado e instalado en ${HPC_STACK_PREFIX}/openmpi."
+            ok "OpenMPI compilado e instalado en ${HPC_INSTALL_PREFIX}."
         else
             warn "Fallo la compilacion de OpenMPI; se usara el paquete openmpi-bin del repositorio."
         fi
-    elif [[ -n "${UCX_PREFIX}" || -n "${LIBFABRIC_PREFIX}" ]]; then
+    elif [[ "${UCX_BUILT_FROM_SOURCE}" == true || "${LIBFABRIC_BUILT_FROM_SOURCE}" == true ]]; then
         warn "Se compilaron UCX/libfabric manualmente pero OpenMPI se instalara desde el repositorio y no aprovechara esas bibliotecas. Si quieres que las use, descarga tambien el tarball de OpenMPI y vuelve a ejecutar el script."
     fi
 
-    if [[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]]; then
-        cat > /etc/profile.d/hpc-stack.sh <<EOF
-# Entorno para la pila HPC compilada manualmente (mas reciente/estable que
-# los paquetes del repositorio), instalada en ${HPC_STACK_PREFIX}.
-export PATH="${HPC_STACK_PREFIX}/openmpi/bin:\${PATH}"
-export LD_LIBRARY_PATH="${HPC_STACK_PREFIX}/openmpi/lib:${UCX_PREFIX:+${UCX_PREFIX}/lib:}${LIBFABRIC_PREFIX:+${LIBFABRIC_PREFIX}/lib:}\${LD_LIBRARY_PATH:-}"
-export PKG_CONFIG_PATH="${HPC_STACK_PREFIX}/openmpi/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
-EOF
-        chmod 644 /etc/profile.d/hpc-stack.sh
-        ldconfig
-        ok "Variables de entorno para la pila HPC compilada publicadas en /etc/profile.d/hpc-stack.sh"
-    fi
+    ldconfig
 
     {
-        echo "UCX_PREFIX=${UCX_PREFIX}"
-        echo "LIBFABRIC_PREFIX=${LIBFABRIC_PREFIX}"
-        echo "LIBXC_PREFIX=${LIBXC_PREFIX}"
+        echo "HPC_INSTALL_PREFIX=${HPC_INSTALL_PREFIX}"
+        echo "UCX_BUILT_FROM_SOURCE=${UCX_BUILT_FROM_SOURCE}"
+        echo "LIBFABRIC_BUILT_FROM_SOURCE=${LIBFABRIC_BUILT_FROM_SOURCE}"
+        echo "LIBXC_BUILT_FROM_SOURCE=${LIBXC_BUILT_FROM_SOURCE}"
         echo "OPENMPI_BUILT_FROM_SOURCE=${OPENMPI_BUILT_FROM_SOURCE}"
     } >> "${STATE_FILE}"
 }
@@ -994,6 +1079,12 @@ stage_nfs_client() {
 
     pkg_install nfs-common
 
+    # Asegura que el cliente NFS quede operativo desde el arranque (antes de
+    # que nadie inicie sesion), tanto para este nodo como para el maestro
+    # cuando actua como cliente de otro recurso.
+    systemctl enable --now rpcbind 2>&1 | tee -a "${LOG_FILE}" || true
+    systemctl enable remote-fs.target 2>&1 | tee -a "${LOG_FILE}" || true
+
     mkdir -p "${NFS_MOUNT_POINT}"
 
     local fstab_line="${MASTER_HOSTNAME}:${NFS_EXPORT_PATH}  ${NFS_MOUNT_POINT}  nfs  defaults,_netdev,noatime,rsize=1048576,wsize=1048576  0  0"
@@ -1011,6 +1102,89 @@ stage_nfs_client() {
     else
         warn "No se pudo montar ${NFS_MOUNT_POINT} todavia. Esto es normal si el maestro aun no exporta esa ruta para este nodo (ver siguiente paso) o si la red IB no esta activa. Se reintentara en cada arranque via fstab."
     fi
+}
+
+# ============================================================================
+# 13b. Directorio compartido del cluster: hosts + llaves SSH entre nodos
+# ============================================================================
+
+stage_cluster_registry() {
+    step "Registrando este nodo en el directorio compartido del cluster (hosts + llaves SSH entre todos los nodos)"
+
+    if [[ "${DO_MOUNT_NFS}" != true ]] || ! mountpoint -q "${NFS_MOUNT_POINT}" 2>/dev/null; then
+        warn "El recurso NFS compartido no esta montado; se omite el registro entre nodos (este nodo solo quedara conectado al maestro)."
+        return 0
+    fi
+
+    local registry_dir="${NFS_MOUNT_POINT}/cluster-conf"
+    if ! mkdir -p "${registry_dir}" 2>/dev/null; then
+        warn "No se pudo crear ${registry_dir} (¿permisos de escritura en el NFS?); se omite el registro entre nodos."
+        return 0
+    fi
+
+    local hosts_pool="${registry_dir}/hosts.cluster"
+    local keys_pool="${registry_dir}/authorized_keys.pool"
+    touch "${hosts_pool}" "${keys_pool}"
+
+    # Si el directorio compartido esta vacio (primer nodo que usa esta
+    # version del script), ofrece registrar ahora los nodos que ya existen
+    # en el cluster para que este nodo (y los siguientes) los reconozcan.
+    if [[ ! -s "${hosts_pool}" ]]; then
+        info "El directorio compartido de nodos esta vacio todavia."
+        if confirm "¿Registrar ahora los nodos que ya existen en el cluster (nombre e IP InfiniBand de cada uno)?" "s"; then
+            while true; do
+                local peer_name peer_ip
+                peer_name="$(ask "Nombre del nodo existente (dejar vacio para terminar)" "")"
+                [[ -z "${peer_name}" ]] && break
+                peer_ip="$(ask "IP InfiniBand de '${peer_name}'")"
+                echo -e "${peer_ip}\t${peer_name}" >> "${hosts_pool}"
+            done
+        fi
+    fi
+
+    # Auto-registro de este nodo (tambien sirve para "auto-encontrarse" y
+    # poder hacer pruebas de redundancia consigo mismo).
+    grep -qF "${NODE_IB_IP}" "${hosts_pool}" || echo -e "${NODE_IB_IP}\t${NODE_NAME}" >> "${hosts_pool}"
+
+    local user_home
+    user_home="$(getent passwd "${CLUSTER_USER}" | cut -d: -f6)"
+    local pubkey_file="${user_home}/.ssh/id_ed25519.pub"
+    if [[ -f "${pubkey_file}" ]] && ! grep -qF "$(cat "${pubkey_file}")" "${keys_pool}" 2>/dev/null; then
+        cat "${pubkey_file}" >> "${keys_pool}"
+    fi
+
+    # Fusiona el directorio compartido con este nodo: /etc/hosts y
+    # authorized_keys, para que cada nodo reconozca (y confie via SSH,
+    # necesario para que "mpirun --host nodo1,nodo2,..." funcione de forma
+    # directa entre nodos y no solo a traves del maestro) a todos los
+    # demas, incluyendose a si mismo.
+    backup_file /etc/hosts
+    while IFS=$'\t' read -r ip name; do
+        [[ -z "${ip}" || -z "${name}" ]] && continue
+        append_once /etc/hosts "${ip}	${name}"
+    done < "${hosts_pool}"
+    ok "/etc/hosts sincronizado con el directorio compartido del cluster ($(grep -c . "${hosts_pool}") nodo(s) registrados)."
+
+    local authorized_keys="${user_home}/.ssh/authorized_keys"
+    touch "${authorized_keys}"
+    while read -r line; do
+        [[ -z "${line}" ]] && continue
+        grep -qF "${line}" "${authorized_keys}" || echo "${line}" >> "${authorized_keys}"
+    done < "${keys_pool}"
+    chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${authorized_keys}"
+    chmod 600 "${authorized_keys}"
+    ok "Llaves SSH de todos los nodos registrados fusionadas en authorized_keys (confianza SSH mutua entre nodos, incluido este nodo consigo mismo)."
+
+    local known_hosts="${user_home}/.ssh/known_hosts"
+    touch "${known_hosts}"
+    while IFS=$'\t' read -r ip name; do
+        [[ -z "${ip}" ]] && continue
+        timeout 5 ssh-keyscan -H "${ip}" >> "${known_hosts}" 2>/dev/null
+    done < "${hosts_pool}"
+    sort -u -o "${known_hosts}" "${known_hosts}"
+    chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${known_hosts}"
+
+    warn "Los nodos que ya existian ANTES de esta version del script no aparecen aqui automaticamente salvo que los hayas registrado en el paso anterior; para que reconozcan a este nodo nuevo, vuelve a ejecutar esta misma etapa en ellos (o este script completo) una vez que este nodo ya este en el directorio compartido."
 }
 
 # ============================================================================
@@ -1058,34 +1232,17 @@ stage_mpi_toolchain() {
     pkg_install build-essential gfortran cmake pkg-config environment-modules
 
     if [[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]]; then
-        info "OpenMPI ya fue compilado desde el tarball descargado (etapa anterior) en ${HPC_STACK_PREFIX}/openmpi; se omiten los paquetes openmpi-bin/libucx del repositorio para evitar que convivan dos instalaciones distintas."
+        info "OpenMPI ya fue compilado desde el tarball descargado (etapa anterior) en ${HPC_INSTALL_PREFIX}; se omiten los paquetes openmpi-bin/libucx del repositorio para evitar que convivan dos instalaciones distintas."
         hash -r
     else
         # OpenMPI es el que habilita la comunicacion entre nodos (y usara los
         # verbs de InfiniBand automaticamente si UCX/ibverbs estan presentes).
         pkg_install openmpi-bin openmpi-common libopenmpi-dev libucx0 libucx-dev ucx-utils
-
-        mkdir -p /etc/openmpi
-        cat > /etc/openmpi/openmpi-mca-params.conf <<'EOF'
-# Preferir UCX (que a su vez usa los verbs de Mellanox/mlx5) para el
-# transporte entre nodos; usar memoria compartida dentro de un mismo nodo.
-pml = ucx
-btl = self,vader
-osc = ucx
-EOF
-        ok "OpenMPI (repositorio) configurado para preferir UCX/InfiniBand entre nodos."
-
-        cat > /etc/profile.d/hpc-mpi.sh <<'EOF'
-# Entorno MPI/InfiniBand para todos los usuarios del cluster.
-export OMPI_MCA_pml=ucx
-export OMPI_MCA_btl=self,vader
-EOF
-        chmod 644 /etc/profile.d/hpc-mpi.sh
-        ok "Variables de entorno MPI publicadas en /etc/profile.d/hpc-mpi.sh"
+        ok "OpenMPI (repositorio) instalado; la preferencia por UCX/InfiniBand se declara en ~/.bashrc en la siguiente etapa."
     fi
 
-    if [[ -n "${LIBXC_PREFIX}" ]]; then
-        info "LibXC ya esta compilado en ${LIBXC_PREFIX}, listo para cuando instales Quantum ESPRESSO."
+    if [[ "${LIBXC_BUILT_FROM_SOURCE}" == true ]]; then
+        info "LibXC ya esta compilado en ${HPC_INSTALL_PREFIX}, listo para cuando instales Quantum ESPRESSO."
     elif apt-cache show libxc-dev >/dev/null 2>&1; then
         pkg_install libxc-dev
         info "libxc-dev instalado desde el repositorio como base minima para Quantum ESPRESSO."
@@ -1097,7 +1254,58 @@ EOF
 }
 
 # ============================================================================
-# 16. Resumen final
+# 16. Variables de entorno en ~/.bashrc (interactivo y NO interactivo)
+# ============================================================================
+
+stage_bashrc_environment() {
+    step "Publicando variables de entorno en ~/.bashrc (para terminales y para mpirun via SSH)"
+
+    local user_home
+    user_home="$(getent passwd "${CLUSTER_USER}" | cut -d: -f6)"
+    local bashrc_file="${user_home}/.bashrc"
+
+    local env_block
+    env_block="$(cat <<EOF
+# Rutas del stack HPC (UCX/OpenMPI/libfabric/LibXC) compiladas manualmente.
+# Este prefijo debe ser IGUAL en todos los nodos del cluster.
+export HPC_PREFIX="${HPC_INSTALL_PREFIX}"
+export PATH="\${HPC_PREFIX}/bin:\${PATH}"
+export LD_LIBRARY_PATH="\${HPC_PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="\${HPC_PREFIX}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
+
+# MPI sobre InfiniBand: preferir UCX (usa los verbs de Mellanox/mlx5) entre
+# nodos y memoria compartida dentro de un mismo nodo.
+export OMPI_MCA_pml=ucx
+export OMPI_MCA_btl=self,vader
+
+# Afinidad de nucleos para AMD Ryzen/Threadripper (1950X de 16 nucleos,
+# 2990WX de 32 nucleos): atar cada proceso/hilo a nucleos concretos evita
+# que el planificador los mueva entre CCX/dies con memoria remota, lo cual
+# en el 2990WX en particular (solo 2 de sus 4 dies tienen memoria conectada
+# directamente) puede ser bastante mas lento. Revisa la topologia real con
+# 'numactl --hardware' o 'lstopo' antes de lanzar trabajos grandes.
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+export OMPI_MCA_hwloc_base_binding_policy=core
+
+# Intel MKL / oneAPI: se activa solo si ya esta instalado (lo instalas tu
+# mismo mas adelante junto con Quantum ESPRESSO).
+if [ -f /opt/intel/oneapi/setvars.sh ]; then
+    source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
+elif [ -f /opt/intel/mkl/bin/mklvars.sh ]; then
+    source /opt/intel/mkl/bin/mklvars.sh intel64 > /dev/null 2>&1
+fi
+EOF
+)"
+
+    inject_bashrc_block "${bashrc_file}" "${env_block}"
+    chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${bashrc_file}"
+    ok "Bloque de entorno insertado al PRINCIPIO de ${bashrc_file} (antes del guardian de shells no interactivas), para que tanto una terminal como 'mpirun ... --host otro_nodo' via SSH vean las mismas rutas."
+    warn "Nota: no reconozco el termino 'CBRW' que mencionaste para afinidad de nucleos en Threadripper; en su lugar aplique las optimizaciones documentadas por la comunidad (afinidad OMP_PROC_BIND/OMP_PLACES, binding de OpenMPI por core, y el override de ACS de PCIe si lo activaste). Si tenias en mente un ajuste especifico con otro nombre, dimelo y lo agrego."
+}
+
+# ============================================================================
+# 17. Resumen final
 # ============================================================================
 
 final_summary() {
@@ -1111,11 +1319,14 @@ final_summary() {
     echo "  Maestro:         ${MASTER_HOSTNAME} (${MASTER_IB_IP})"
     echo "  Recurso NFS:     ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT}"
     echo
-    echo "Bibliotecas HPC compiladas manualmente:"
-    echo "  UCX:       ${UCX_PREFIX:-no (repositorio)}"
-    echo "  libfabric: ${LIBFABRIC_PREFIX:-no instalado}"
-    echo "  LibXC:     ${LIBXC_PREFIX:-no instalado}"
-    echo "  OpenMPI:   $([[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]] && echo "${HPC_STACK_PREFIX}/openmpi (compilado)" || echo "repositorio")"
+    echo "Bibliotecas HPC (prefijo comun: ${HPC_INSTALL_PREFIX}):"
+    echo "  UCX:       $([[ "${UCX_BUILT_FROM_SOURCE}" == true ]] && echo "compilado en ${HPC_INSTALL_PREFIX}" || echo "repositorio")"
+    echo "  libfabric: $([[ "${LIBFABRIC_BUILT_FROM_SOURCE}" == true ]] && echo "compilado en ${HPC_INSTALL_PREFIX}" || echo "no instalado")"
+    echo "  LibXC:     $([[ "${LIBXC_BUILT_FROM_SOURCE}" == true ]] && echo "compilado en ${HPC_INSTALL_PREFIX}" || echo "no instalado")"
+    echo "  OpenMPI:   $([[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]] && echo "compilado en ${HPC_INSTALL_PREFIX}" || echo "repositorio")"
+    echo
+    echo "Directorio compartido del cluster (hosts + llaves SSH entre nodos):"
+    echo "  ${NFS_MOUNT_POINT}/cluster-conf/ (si el NFS estaba montado en esta ejecucion)"
     echo
 
     if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
@@ -1143,8 +1354,16 @@ Pasos manuales pendientes (fuera del alcance de este script):
   5. Instala luego Intel MKL y Quantum ESPRESSO (con su interfaz grafica)
      sobre esta base; el toolchain de compilacion y MPI ya esta listo.
   6. Revisa en la BIOS del nodo: 'Global C-State Control' / 'Core C6 State'
-     en Disabled, y el plan de energia en modo alto rendimiento, para
-     complementar los ajustes de software aplicados aqui.
+     en Disabled, y el plan de energia en modo alto rendimiento (en el
+     2990WX, tambien 'NUMA nodes per socket' = 4/Die), para complementar
+     los ajustes de software aplicados aqui.
+  7. Las variables de entorno (MPI, MKL cuando lo instales, afinidad de
+     nucleos) ya quedaron en ~${CLUSTER_USER}/.bashrc, activas tanto en una
+     terminal como al lanzar 'mpirun --host otro_nodo' via SSH.
+  8. Si ya tenias otros nodos en el cluster y no los registraste cuando el
+     script te lo pregunto, vuelve a correr este script (o al menos la
+     etapa del directorio compartido) en ellos para que reconozcan a este
+     nodo nuevo por /etc/hosts y por SSH.
 
 Log completo: ${LOG_FILE}
 Parametros usados guardados en: ${STATE_FILE}
@@ -1178,8 +1397,10 @@ main() {
     run_stage stage_hosts_file           "/etc/hosts"
     run_stage stage_ssh_keys             "Llaves SSH"
     run_stage stage_nfs_client           "Cliente NFS"
+    run_stage stage_cluster_registry     "Directorio compartido del cluster"
     run_stage stage_remote_exports       "Exports remotos en el maestro"
     run_stage stage_mpi_toolchain        "Toolchain MPI/OpenMP"
+    run_stage stage_bashrc_environment   "Variables de entorno en .bashrc"
 
     final_summary
 }

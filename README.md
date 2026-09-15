@@ -18,7 +18,12 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
 - **Gobernador de CPU en `performance`** de forma persistente y, de forma
   opcional, parametros de kernel (`processor.max_cstate=1 idle=nomwait`)
   como mitigacion conocida para los congelamientos por estados C profundos
-  en plataformas **AMD Ryzen**.
+  en plataformas **AMD Ryzen/Threadripper** (1950X, 2990WX). Tambien
+  opcional: `pcie_acs_override=downstream,multifunction`, el workaround
+  documentado por la comunidad para el trafico peer-to-peer (InfiniBand/GPU)
+  en Threadripper. Instala `numactl`/`hwloc-nox` y muestra la topologia NUMA
+  real (relevante en el 2990WX, donde solo 2 de sus 4 dies tienen memoria
+  conectada directamente).
 - **Limites de memoria** (`memlock`, `nofile`) necesarios para RDMA, tanto
   vía PAM como vía `systemd` (incluyendo el servicio SSH).
 - Instalacion de la pila **RDMA/InfiniBand** (`rdma-core`, `ibverbs-utils`,
@@ -30,17 +35,30 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   **UCX, libfabric, LibXC y OpenMPI** ya descargados para compilarlos e
   instalarlos manualmente (suelen ser mas recientes/estables para RDMA que
   los paquetes de Mint/Ubuntu); si no se encuentran o el usuario no lo pide,
-  se usan los paquetes del repositorio.
+  se usan los paquetes del repositorio. Todo se instala en **el mismo
+  prefijo** (configurable, por defecto `/usr/local`), que debe coincidir con
+  la ruta que ya usan los demas nodos del cluster para evitar conflictos.
 - Configuracion de la interfaz **IPoIB** (`ib0`) con IP estatica en modo
   "connected" (MTU 65520).
 - Actualizacion de `/etc/hosts`, generacion de **llaves SSH** y copia hacia
   el nodo `master`.
 - Cliente **NFS** y montaje del recurso compartido (por defecto `/cluster`),
-  con la opcion de registrar automaticamente el nodo en `/etc/exports` del
-  maestro via SSH.
+  con arranque automatico via `rpcbind`/`remote-fs.target`, y la opcion de
+  registrar automaticamente el nodo en `/etc/exports` del maestro via SSH.
+- **Directorio compartido del cluster** (dentro del propio NFS, en
+  `cluster-conf/`): fusiona `/etc/hosts` y `authorized_keys` de todos los
+  nodos que han pasado por el script, incluyendo el auto-registro de este
+  mismo nodo (util para pruebas de redundancia) y, la primera vez, la
+  opcion de registrar a mano los nodos que ya existian antes.
 - Toolchain de compilacion y **MPI** (`build-essential`, `gfortran`,
   OpenMPI + UCX) configurado para usar InfiniBand entre nodos; OpenMP ya
   viene incluido en `gcc`/`gfortran` (`-fopenmp`).
+- Variables de entorno (rutas del stack HPC, preferencia UCX de OpenMPI,
+  afinidad de nucleos para Threadripper, activacion automatica de Intel
+  MKL si esta instalado) inyectadas al **principio** de `~/.bashrc` del
+  usuario del cluster, antes del guardian que corta la ejecucion para
+  shells no interactivas — asi tambien las ve `mpirun --host otro_nodo`
+  cuando lanza procesos remotos via SSH, no solo una terminal abierta.
 
 Al terminar, el nodo queda listo para instalar sobre esta base las
 bibliotecas de aplicacion (Intel MKL, Quantum ESPRESSO, etc.).
@@ -76,5 +94,10 @@ parametros usados en `/etc/hpc-cluster/node.conf`.
    `ibping`.
 4. Prueba MPI entre nodos: `mpirun --host <nodo>,<master> -np 2 hostname`.
 5. Revisa en la BIOS del nodo `Global C-State Control` / `Core C6 State` en
-   *Disabled* como complemento a los ajustes de software, si persisten
-   congelamientos.
+   *Disabled* (y en el 2990WX, `NUMA nodes per socket` = 4/Die) como
+   complemento a los ajustes de software, si persisten congelamientos.
+6. Las variables de entorno ya quedan en `~/.bashrc`; no hace falta tocarlas
+   a mano salvo que instales algo en una ruta distinta.
+7. Si ya tenias otros nodos en el cluster, vuelve a correr este script (o
+   al menos la etapa del directorio compartido) en ellos para que
+   reconozcan por `/etc/hosts` y SSH a este nodo nuevo.
