@@ -80,7 +80,9 @@ bibliotecas de aplicacion (Intel MKL, Quantum ESPRESSO, etc.).
 ## Uso
 
 ```bash
-sudo ./configure-new-node.sh
+sudo ./configure-new-node.sh              # configuracion interactiva
+sudo ./configure-new-node.sh --rollback   # modo de rescate (ver abajo)
+sudo ./configure-new-node.sh --help
 ```
 
 El script es **interactivo**: pregunta el nombre del nodo, la IP InfiniBand
@@ -90,6 +92,32 @@ mismo nodo sin problema; los pasos son idempotentes.
 
 Registra su actividad en `/var/log/hpc-node-setup.log` y guarda los
 parametros usados en `/etc/hpc-cluster/node.conf`.
+
+## Modo de rescate (`--rollback`)
+
+Cada etapa deja registrado en `/etc/hpc-cluster/manifest.log` cada archivo
+que crea o modifica (con copia de respaldo `.hpc-orig` para lo que ya
+existia). Si algo sale mal y no hay forma de recuperar el estado anterior,
+`sudo ./configure-new-node.sh --rollback`:
+
+1. Deshace esos cambios en orden inverso (restaura los `.hpc-orig`, borra
+   los archivos/unidades systemd que el script creo, desenmascara
+   suspension/hibernacion, restaura el hostname y el target de arranque por
+   defecto, borra la conexion de red IPoIB creada).
+2. Aplica ademas una **red de seguridad fija**, independiente del
+   manifiesto (por si esta incompleto o no existe): deja SSH habilitado,
+   desenmascara suspension/hibernacion, y si hay GRUB, lo regenera desde
+   `/etc/default/grub` ya restaurado.
+3. Quita el bloque de variables de entorno de `~/.bashrc`.
+
+El objetivo es que, pase lo que pase, el nodo quede **arrancable y
+minimamente usable** (sin InfiniBand ni los ajustes de estabilidad) para
+poder reintentar la configuracion desde cero.
+
+**A propósito nunca toca:** el usuario/grupo del cluster ni sus archivos
+(home, llaves SSH), los paquetes instalados via `apt`, ni el directorio
+compartido del cluster en el NFS (`cluster-conf/`) — otros nodos pueden
+depender de el.
 
 ## Requisitos previos
 
@@ -111,6 +139,19 @@ el directorio `~/.ssh` se creaba como root (700) antes de generar la llave
 como el usuario del cluster, lo que hacia fallar `ssh-keygen` por permisos;
 y si `ssh-keygen` fallaba, el script igual reportaba exito en vez de
 marcar la etapa como fallida.
+
+Una segunda ronda de revision (logica, redundancia, consistencia) encontro
+y corrigio: una variable muerta sin usar, la mascara CIDR de InfiniBand sin
+validar, dos archivos de PAM modificados sin respaldo previo, y una doble
+instalacion de UCX (repositorio + compilado) cuando solo UCX se compilaba
+desde fuente pero OpenMPI no. Tambien se agrego el sistema de manifiesto +
+`--rollback`, y se probo de punta a punta: se tomo una foto del estado del
+sistema antes de correr el script, se corrio el script completo, se corrio
+`--rollback`, y se comparo — `/etc/hosts`, `/etc/fstab` y los archivos de
+PAM quedaron **bit a bit identicos** al estado original, los 12
+archivos/unidades creados desaparecieron, y el usuario del cluster no se
+toco. Tambien se probo `--rollback` sin manifiesto (cae a la red de
+seguridad sola) y ejecutado dos veces seguidas (idempotente).
 
 ## Despues de ejecutar el script
 

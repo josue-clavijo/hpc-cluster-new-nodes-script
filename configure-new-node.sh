@@ -7,11 +7,20 @@
 # pensado para Linux Mint Cinnamon (base Ubuntu).
 #
 # Uso:
-#   sudo ./configure-new-node.sh
+#   sudo ./configure-new-node.sh              (configuracion interactiva)
+#   sudo ./configure-new-node.sh --rollback    (deshace todo, modo rescate)
+#   sudo ./configure-new-node.sh --help
 #
 # El script es interactivo (pregunta nombre de nodo, IP InfiniBand, etc.)
 # y esta dividido en etapas idempotentes: se puede volver a ejecutar sobre
 # el mismo nodo sin romper nada si algun paso fallo o si se quiere repetir.
+#
+# Cada etapa registra en un manifiesto (/etc/hpc-cluster/manifest.log) todo
+# archivo que crea o modifica; si algo sale mal y no se puede recuperar el
+# estado anterior de otra forma, "--rollback" deshace esos cambios y aplica
+# una red de seguridad fija (SSH habilitado, sin suspension enmascarada,
+# GRUB regenerado) para dejar el nodo arrancable y listo para reintentar,
+# aunque quede sin InfiniBand ni los ajustes de estabilidad.
 #
 # Etapas:
 #   1) Chequeos previos (root, distro, log)
@@ -51,6 +60,9 @@ SCRIPT_VERSION="1.0.0"
 LOG_FILE="/var/log/hpc-node-setup.log"
 STATE_DIR="/etc/hpc-cluster"
 STATE_FILE="${STATE_DIR}/node.conf"
+# Bitacora de todo lo que este script crea o modifica, para poder deshacerlo
+# con --rollback si algo sale mal. Ver rollback_mode() al final del archivo.
+MANIFEST_FILE="${STATE_DIR}/manifest.log"
 
 CLUSTER_USER="ryzen"
 CLUSTER_GROUP="ryzen"
@@ -69,7 +81,6 @@ COLOR_BOLD="\e[1m"
 
 STEP_NUM=0
 FAILED_STEPS=()
-SKIPPED_STEPS=()
 SSH_TRUST_OK=false
 IB_IFACE=""
 IB_CARD_PRESENT=true
@@ -153,11 +164,40 @@ require_root() {
     fi
 }
 
+manifest_add() {
+    # manifest_add <entrada> -> registra una linea en el manifiesto de
+    # cambios (para --rollback), evitando duplicados.
+    mkdir -p "${STATE_DIR}"
+    grep -qF -- "$1" "${MANIFEST_FILE}" 2>/dev/null || echo "$1" >> "${MANIFEST_FILE}"
+}
+
 backup_file() {
+    # Guarda una copia del archivo ANTES de tocarlo (si aun no existe una) y
+    # lo registra en el manifiesto para poder restaurarlo con --rollback.
     local f="$1"
     if [[ -f "${f}" && ! -f "${f}.hpc-orig" ]]; then
         cp -a "${f}" "${f}.hpc-orig"
     fi
+    [[ -f "${f}.hpc-orig" ]] && manifest_add "BACKUP|${f}"
+}
+
+track_created() {
+    # track_created <ruta> -> si la ruta NO existia todavia, la registra
+    # como "creada por este script" para poder borrarla con --rollback.
+    # Se llama ANTES de crear el archivo/unidad.
+    local f="$1"
+    [[ -e "${f}" ]] && return 0
+    manifest_add "CREATED|${f}"
+}
+
+track_state() {
+    # track_state <clave> <valor> -> guarda un dato puntual (hostname
+    # anterior, target por defecto anterior, etc.) para poder restaurarlo.
+    manifest_add "STATE|$1|$2"
+}
+
+cluster_user_home() {
+    getent passwd "${CLUSTER_USER}" | cut -d: -f6
 }
 
 line_in_file_present() {
@@ -333,6 +373,26 @@ inject_bashrc_block() {
     rm -f "${rest_file}"
 }
 
+remove_bashrc_block() {
+    # Contraparte de inject_bashrc_block: quita el bloque marcado por
+    # completo (sin volver a insertar nada), para --rollback.
+    local bashrc_file="$1"
+    local marker_start="# >>> hpc-cluster-new-nodes-script (bloque generado automaticamente; no borrar) >>>"
+    local marker_end="# <<< hpc-cluster-new-nodes-script <<<"
+
+    [[ -f "${bashrc_file}" ]] || return 0
+    grep -qF "${marker_start}" "${bashrc_file}" || return 0
+
+    local tmp
+    tmp="$(mktemp)"
+    awk -v start="${marker_start}" -v end="${marker_end}" '
+        $0==start {skip=1; next}
+        $0==end   {skip=0; next}
+        !skip {print}
+    ' "${bashrc_file}" > "${tmp}"
+    mv "${tmp}" "${bashrc_file}"
+}
+
 trap 'err "Interrumpido por el usuario (Ctrl+C)."; exit 130' INT
 
 # ============================================================================
@@ -389,6 +449,10 @@ gather_input() {
     MASTER_HOSTNAME="$(ask "Nombre de host del nodo maestro" "master")"
     MASTER_IB_IP="$(ask "IP InfiniBand del nodo maestro" "10.10.10.1")"
     IB_NETMASK_CIDR="$(ask "Mascara de la red InfiniBand en formato CIDR (24 = 255.255.255.0, 16 = 255.255.0.0). DEBE coincidir con la de los demas nodos" "${IB_NETMASK_CIDR}")"
+    while ! [[ "${IB_NETMASK_CIDR}" =~ ^[0-9]+$ ]] || (( IB_NETMASK_CIDR < 1 || IB_NETMASK_CIDR > 32 )); do
+        warn "Debe ser un numero entre 1 y 32 (24 y 16 son los mas comunes)."
+        IB_NETMASK_CIDR="$(ask "Mascara de la red InfiniBand en formato CIDR" "24")"
+    done
 
     echo
     echo -e "${COLOR_BOLD}--- Recursos remotos ---${COLOR_RESET}"
@@ -515,6 +579,7 @@ stage_user_and_autologin() {
 
     if command -v lightdm >/dev/null 2>&1 || dpkg -l | grep -qi lightdm; then
         mkdir -p /etc/lightdm/lightdm.conf.d
+        track_created /etc/lightdm/lightdm.conf.d/50-hpc-autologin.conf
         cat > /etc/lightdm/lightdm.conf.d/50-hpc-autologin.conf <<EOF
 [Seat:*]
 autologin-user=${CLUSTER_USER}
@@ -541,6 +606,9 @@ stage_cinnamon_stability() {
     # La interfaz grafica Cinnamon se deja siempre activa (nunca se cambia a
     # modo texto/headless) porque se necesita para monitorear el nodo
     # localmente mientras trabaja el cluster.
+    local prev_default_target
+    prev_default_target="$(systemctl get-default 2>/dev/null || echo graphical.target)"
+    track_state "PREV_DEFAULT_TARGET" "${prev_default_target}"
     systemctl set-default graphical.target 2>&1 | tee -a "${LOG_FILE}" || true
     if command -v lightdm >/dev/null 2>&1 || dpkg -l | grep -qi lightdm; then
         systemctl enable lightdm 2>&1 | tee -a "${LOG_FILE}" || true
@@ -553,12 +621,14 @@ stage_cinnamon_stability() {
     fi
 
     mkdir -p /etc/dconf/profile
+    track_created /etc/dconf/profile/user
     cat > /etc/dconf/profile/user <<'EOF'
 user-db:user
 system-db:local
 EOF
 
     mkdir -p /etc/dconf/db/local.d
+    track_created /etc/dconf/db/local.d/00-hpc-node-stability
     cat > /etc/dconf/db/local.d/00-hpc-node-stability <<'EOF'
 # Ajustes de estabilidad para nodos de computo: nunca suspender, nunca
 # bloquear pantalla, nunca apagar el disco/monitor por inactividad.
@@ -596,6 +666,7 @@ EOF
 
     # Bloquear estas claves para que ningun usuario las cambie sin querer.
     mkdir -p /etc/dconf/db/local.d/locks
+    track_created /etc/dconf/db/local.d/locks/hpc-node-stability
     cat > /etc/dconf/db/local.d/locks/hpc-node-stability <<'EOF'
 /org/cinnamon/settings-daemon/plugins/power/sleep-inactive-ac-type
 /org/cinnamon/settings-daemon/plugins/power/sleep-inactive-battery-type
@@ -609,6 +680,7 @@ EOF
 
     # xscreensaver / DPMS por si acaso el entorno grafico X11 los usa.
     if [[ -d /etc/X11/xorg.conf.d ]]; then
+        track_created /etc/X11/xorg.conf.d/10-hpc-no-dpms.conf
         cat > /etc/X11/xorg.conf.d/10-hpc-no-dpms.conf <<'EOF'
 Section "ServerFlags"
     Option "BlankTime"   "0"
@@ -635,9 +707,11 @@ stage_disable_sleep() {
     step "Desactivando suspension/hibernacion a nivel del sistema"
 
     systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>&1 | tee -a "${LOG_FILE}" || true
+    track_state "MASKED_SLEEP_TARGETS" "sleep.target suspend.target hibernate.target hybrid-sleep.target"
     ok "Objetivos systemd de suspension/hibernacion enmascarados."
 
     mkdir -p /etc/systemd/logind.conf.d
+    track_created /etc/systemd/logind.conf.d/99-hpc-no-sleep.conf
     cat > /etc/systemd/logind.conf.d/99-hpc-no-sleep.conf <<'EOF'
 [Login]
 HandleLidSwitch=ignore
@@ -653,6 +727,7 @@ EOF
     # Desactivar el autosuspend de USB, causa comun de "cuelgues" en nodos
     # sin monitor donde el teclado/mouse USB entra en ahorro de energia.
     mkdir -p /etc/udev/rules.d
+    track_created /etc/udev/rules.d/50-hpc-no-usb-autosuspend.rules
     cat > /etc/udev/rules.d/50-hpc-no-usb-autosuspend.rules <<'EOF'
 ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
 EOF
@@ -669,6 +744,7 @@ stage_cpu_stability() {
 
     pkg_install linux-tools-common "linux-tools-$(uname -r)" cpufrequtils numactl hwloc-nox
 
+    track_created /usr/local/sbin/hpc-set-cpu-performance.sh
     cat > /usr/local/sbin/hpc-set-cpu-performance.sh <<'EOF'
 #!/usr/bin/env bash
 # Fija el gobernador de frecuencia de todos los nucleos en "performance"
@@ -679,6 +755,7 @@ done
 EOF
     chmod +x /usr/local/sbin/hpc-set-cpu-performance.sh
 
+    track_created /etc/systemd/system/hpc-cpu-performance.service
     cat > /etc/systemd/system/hpc-cpu-performance.service <<'EOF'
 [Unit]
 Description=Fijar gobernador de CPU en modo performance (estabilidad del nodo HPC)
@@ -743,6 +820,7 @@ EOF
 
     # Reducir el uso de swap para minimizar pausas por intercambio de memoria
     # en nodos que corren trabajos MPI intensivos en RAM.
+    track_created /etc/sysctl.d/99-hpc-stability.conf
     cat > /etc/sysctl.d/99-hpc-stability.conf <<'EOF'
 vm.swappiness=10
 vm.dirty_ratio=10
@@ -762,6 +840,7 @@ stage_memory_limits() {
     step "Configurando limites de memoria (memlock/nofile) para RDMA"
 
     mkdir -p /etc/security/limits.d
+    track_created /etc/security/limits.d/99-hpc-cluster.conf
     cat > /etc/security/limits.d/99-hpc-cluster.conf <<EOF
 # RDMA/InfiniBand requiere poder anclar (pin) memoria sin limite para
 # registrar regiones de memoria con los verbs de Mellanox.
@@ -782,21 +861,26 @@ EOF
 
     # Asegurar que pam_limits este habilitado (normalmente ya lo esta en Ubuntu/Mint).
     for pamfile in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
-        if [[ -f "${pamfile}" ]] && ! grep -q "pam_limits.so" "${pamfile}"; then
-            echo "session required pam_limits.so" >> "${pamfile}"
-            ok "pam_limits habilitado en ${pamfile}"
+        if [[ -f "${pamfile}" ]]; then
+            backup_file "${pamfile}"
+            if ! grep -q "pam_limits.so" "${pamfile}"; then
+                echo "session required pam_limits.so" >> "${pamfile}"
+                ok "pam_limits habilitado en ${pamfile}"
+            fi
         fi
     done
 
     # Los procesos lanzados por systemd (incluido sshd en algunos setups)
     # no siempre heredan limits.conf; se fija tambien a nivel de systemd.
     mkdir -p /etc/systemd/system.conf.d
+    track_created /etc/systemd/system.conf.d/99-hpc-memlock.conf
     cat > /etc/systemd/system.conf.d/99-hpc-memlock.conf <<'EOF'
 [Manager]
 DefaultLimitMEMLOCK=infinity
 EOF
 
     mkdir -p /etc/systemd/system/ssh.service.d
+    track_created /etc/systemd/system/ssh.service.d/99-hpc-memlock.conf
     cat > /etc/systemd/system/ssh.service.d/99-hpc-memlock.conf <<'EOF'
 [Service]
 LimitMEMLOCK=infinity
@@ -829,6 +913,7 @@ stage_infiniband_packages() {
         srptools \
         libibumad3
 
+    track_created /etc/modules-load.d/hpc-infiniband.conf
     cat > /etc/modules-load.d/hpc-infiniband.conf <<'EOF'
 # Modulos necesarios para tarjetas Mellanox ConnectX (driver mlx5) e IPoIB.
 mlx5_core
@@ -994,6 +1079,7 @@ stage_ipoib_interface() {
             || nmcli connection add type infiniband ifname "${ib_iface}" con-name "hpc-${ib_iface}" \
                 ip4 "${NODE_IB_IP}/${IB_NETMASK_CIDR}" connection.autoconnect yes 2>&1 | tee -a "${LOG_FILE}"
         nmcli connection up "hpc-${ib_iface}" 2>&1 | tee -a "${LOG_FILE}" || warn "No se pudo activar la conexion ${ib_iface} automaticamente; revisa 'nmcli connection show'."
+        track_state "NMCLI_CONN" "hpc-${ib_iface}"
         ok "Interfaz ${ib_iface} configurada via NetworkManager con IP ${NODE_IB_IP}."
     else
         warn "NetworkManager no esta activo; configurando ${ib_iface} directamente con 'ip' (no persiste tras reiniciar)."
@@ -1003,6 +1089,7 @@ stage_ipoib_interface() {
 
     # Forzar modo "connected" para maximo MTU/rendimiento, de forma persistente.
     mkdir -p /etc/udev/rules.d
+    track_created /etc/udev/rules.d/60-hpc-ipoib-mode.rules
     cat > /etc/udev/rules.d/60-hpc-ipoib-mode.rules <<EOF
 ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="${ib_iface}", RUN+="/bin/sh -c 'echo connected > /sys/class/net/%k/mode; echo 65520 > /sys/class/net/%k/mtu'"
 EOF
@@ -1027,6 +1114,7 @@ stage_hosts_file() {
 
     if [[ "$(hostname)" != "${NODE_NAME}" ]]; then
         if confirm "El hostname actual es '$(hostname)'. ¿Cambiarlo a '${NODE_NAME}'?" "s"; then
+            track_state "PREV_HOSTNAME" "$(hostname)"
             hostnamectl set-hostname "${NODE_NAME}"
             sed -i "s/127.0.1.1.*/127.0.1.1\t${NODE_NAME}/" /etc/hosts 2>/dev/null || append_once /etc/hosts "127.0.1.1	${NODE_NAME}"
             ok "Hostname cambiado a ${NODE_NAME}."
@@ -1045,7 +1133,7 @@ stage_ssh_keys() {
     systemctl enable --now ssh 2>&1 | tee -a "${LOG_FILE}" || true
 
     local user_home
-    user_home="$(getent passwd "${CLUSTER_USER}" | cut -d: -f6)"
+    user_home="$(cluster_user_home)"
     local ssh_dir="${user_home}/.ssh"
 
     mkdir -p "${ssh_dir}"
@@ -1188,7 +1276,7 @@ stage_cluster_registry() {
     grep -qF "${NODE_IB_IP}" "${hosts_pool}" || echo -e "${NODE_IB_IP}\t${NODE_NAME}" >> "${hosts_pool}"
 
     local user_home
-    user_home="$(getent passwd "${CLUSTER_USER}" | cut -d: -f6)"
+    user_home="$(cluster_user_home)"
     local pubkey_file="${user_home}/.ssh/id_ed25519.pub"
     if [[ -f "${pubkey_file}" ]] && ! grep -qF "$(cat "${pubkey_file}")" "${keys_pool}" 2>/dev/null; then
         cat "${pubkey_file}" >> "${keys_pool}"
@@ -1299,7 +1387,13 @@ stage_mpi_toolchain() {
     else
         # OpenMPI es el que habilita la comunicacion entre nodos (y usara los
         # verbs de InfiniBand automaticamente si UCX/ibverbs estan presentes).
-        pkg_install openmpi-bin openmpi-common libopenmpi-dev libucx0 libucx-dev ucx-utils
+        local openmpi_pkgs=(openmpi-bin openmpi-common libopenmpi-dev)
+        if [[ "${UCX_BUILT_FROM_SOURCE}" == true ]]; then
+            info "UCX ya fue compilado desde fuente; se omite el paquete libucx del repositorio para no tener dos instalaciones distintas conviviendo."
+        else
+            openmpi_pkgs+=(libucx0 libucx-dev ucx-utils)
+        fi
+        pkg_install "${openmpi_pkgs[@]}"
         ok "OpenMPI (repositorio) instalado; la preferencia por UCX/InfiniBand se declara en ~/.bashrc en la siguiente etapa."
     fi
 
@@ -1323,7 +1417,7 @@ stage_bashrc_environment() {
     step "Publicando variables de entorno en ~/.bashrc (para terminales y para mpirun via SSH)"
 
     local user_home
-    user_home="$(getent passwd "${CLUSTER_USER}" | cut -d: -f6)"
+    user_home="$(cluster_user_home)"
     local bashrc_file="${user_home}/.bashrc"
 
     local env_block
@@ -1495,10 +1589,166 @@ EOF
 }
 
 # ============================================================================
+# Modo de rescate: --rollback
+# ============================================================================
+#
+# Deshace todo lo que este script cambio en el sistema, usando el manifiesto
+# de cambios (${MANIFEST_FILE}) que cada etapa va llenando, y ADEMAS aplica
+# una "red de seguridad" fija que no depende del manifiesto (por si esta
+# incompleto o corrupto): siempre desenmascara suspension/hibernacion, deja
+# SSH habilitado, y si hay GRUB, regenera el cmdline desde /etc/default/grub
+# ya restaurado. La idea es que, pase lo que pase, el nodo quede arrancable
+# y minimamente usable (sin InfiniBand ni ajustes de estabilidad) para poder
+# reintentar la configuracion desde cero.
+#
+# A PROPOSITO nunca toca: el usuario/grupo del cluster ni sus archivos
+# (llaves SSH, home, etc.), los paquetes instalados via apt, ni el
+# directorio compartido en el NFS (otros nodos pueden depender de el).
+
+rollback_mode() {
+    require_root
+    mkdir -p "${STATE_DIR}"
+    touch "${LOG_FILE}"
+
+    echo -e "${COLOR_BOLD}${COLOR_RED}=== Modo de rescate: revirtiendo la configuracion de este script ===${COLOR_RESET}"
+    echo "Esto deja el nodo en un estado minimo y arrancable (sin InfiniBand ni"
+    echo "ajustes de estabilidad, con los valores por defecto de Ubuntu/Mint),"
+    echo "para poder diagnosticar o volver a intentar la configuracion desde cero."
+    echo
+    echo "NO se toca: el usuario '${CLUSTER_USER}' ni sus archivos/llaves SSH, los"
+    echo "paquetes instalados, ni el directorio compartido del cluster en el NFS"
+    echo "(otros nodos pueden depender de el)."
+    echo
+    confirm "¿Continuar con el rollback?" "n" || { info "Cancelado."; exit 0; }
+
+    local restored=0 removed=0 failed=0
+
+    if [[ -f "${MANIFEST_FILE}" ]]; then
+        info "Deshaciendo cambios registrados en ${MANIFEST_FILE} (en orden inverso)..."
+        local ordered_manifest
+        ordered_manifest="$(tac "${MANIFEST_FILE}" 2>/dev/null || sort -r "${MANIFEST_FILE}")"
+        local line kind rest key value unit_name
+        while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            kind="${line%%|*}"
+            rest="${line#*|}"
+            case "${kind}" in
+                BACKUP)
+                    if [[ -f "${rest}.hpc-orig" ]]; then
+                        if cp -a "${rest}.hpc-orig" "${rest}"; then
+                            ok "Restaurado: ${rest}"
+                            restored=$((restored + 1))
+                        else
+                            err "No se pudo restaurar ${rest}"
+                            failed=$((failed + 1))
+                        fi
+                    fi
+                    ;;
+                CREATED)
+                    if [[ -e "${rest}" ]]; then
+                        if [[ "${rest}" == /etc/systemd/system/*.service || "${rest}" == /etc/systemd/system/*.target ]]; then
+                            unit_name="$(basename "${rest}")"
+                            systemctl disable --now "${unit_name}" 2>/dev/null || true
+                        fi
+                        if rm -f "${rest}"; then
+                            ok "Eliminado: ${rest}"
+                            removed=$((removed + 1))
+                        else
+                            err "No se pudo eliminar ${rest}"
+                            failed=$((failed + 1))
+                        fi
+                    fi
+                    ;;
+                STATE)
+                    key="${rest%%|*}"
+                    value="${rest#*|}"
+                    case "${key}" in
+                        PREV_DEFAULT_TARGET)
+                            systemctl set-default "${value}" 2>&1 | tee -a "${LOG_FILE}" || true
+                            ok "Target de arranque por defecto restaurado a '${value}'."
+                            ;;
+                        MASKED_SLEEP_TARGETS)
+                            # shellcheck disable=SC2086
+                            systemctl unmask ${value} 2>&1 | tee -a "${LOG_FILE}" || true
+                            ok "Objetivos de suspension desenmascarados (${value})."
+                            ;;
+                        PREV_HOSTNAME)
+                            hostnamectl set-hostname "${value}" 2>&1 | tee -a "${LOG_FILE}" || true
+                            ok "Hostname restaurado a '${value}'."
+                            ;;
+                        NMCLI_CONN)
+                            command -v nmcli >/dev/null 2>&1 && nmcli connection delete "${value}" >/dev/null 2>&1
+                            ok "Conexion de red '${value}' eliminada (si existia)."
+                            ;;
+                    esac
+                    ;;
+            esac
+        done <<< "${ordered_manifest}"
+    else
+        warn "No se encontro un manifiesto de cambios (${MANIFEST_FILE}); se aplica solo la red de seguridad basica."
+    fi
+
+    info "Aplicando red de seguridad minima (independiente del manifiesto)..."
+    systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null || true
+    systemctl enable --now ssh 2>&1 | tee -a "${LOG_FILE}" || systemctl enable --now sshd 2>&1 | tee -a "${LOG_FILE}" || true
+    systemctl get-default >/dev/null 2>&1 || systemctl set-default graphical.target 2>/dev/null || true
+    if [[ -f /etc/default/grub ]] && command -v update-grub >/dev/null 2>&1; then
+        update-grub 2>&1 | tee -a "${LOG_FILE}" || warn "update-grub fallo; revisa /etc/default/grub manualmente."
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+
+    local user_home
+    user_home="$(cluster_user_home 2>/dev/null || true)"
+    if [[ -n "${user_home}" && -f "${user_home}/.bashrc" ]]; then
+        remove_bashrc_block "${user_home}/.bashrc"
+        ok "Bloque de entorno HPC quitado de ${user_home}/.bashrc."
+    fi
+
+    echo
+    echo -e "${COLOR_BOLD}${COLOR_GREEN}=== Rollback terminado ===${COLOR_RESET}"
+    echo "  Archivos restaurados desde respaldo: ${restored}"
+    echo "  Archivos/unidades creados por el script y eliminados: ${removed}"
+    if [[ "${failed}" -gt 0 ]]; then
+        warn "  ${failed} accion(es) del manifiesto fallaron; revisa ${LOG_FILE}."
+    fi
+    echo
+    echo "NO se tocaron (a proposito): el usuario '${CLUSTER_USER}' y sus archivos,"
+    echo "los paquetes instalados via apt, ni el directorio compartido del cluster"
+    echo "en el NFS (${NFS_MOUNT_POINT:-/cluster}/cluster-conf, si existia)."
+    echo
+    warn "REINICIA el nodo para que los cambios de GRUB/systemd surtan efecto por completo."
+
+    if [[ -f "${MANIFEST_FILE}" ]]; then
+        mv "${MANIFEST_FILE}" "${MANIFEST_FILE}.rolled-back.$(date +%s)"
+    fi
+}
+
+print_help() {
+    cat <<EOF
+Uso: sudo $0 [opcion]
+
+Sin opciones: ejecuta la configuracion interactiva completa del nodo.
+
+Opciones:
+  --rollback, -r   Deshace todo lo que este script haya cambiado en el
+                    sistema y lo deja en un estado minimo arrancable (ver
+                    comentario de rollback_mode() en el codigo). Es el
+                    "fail-safe" para cuando algo salio mal y no se puede
+                    recuperar el estado anterior de otra forma.
+  --help, -h        Muestra esta ayuda.
+EOF
+}
+
+# ============================================================================
 # main
 # ============================================================================
 
 main() {
+    case "${1:-}" in
+        --rollback|-r) rollback_mode; exit $? ;;
+        --help|-h) print_help; exit 0 ;;
+    esac
+
     preflight
     gather_input
 
