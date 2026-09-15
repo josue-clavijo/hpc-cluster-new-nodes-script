@@ -1382,6 +1382,37 @@ fi
 # tenerlo desactivado); cambialo a un valor fijo (p.ej. AVX2) si necesitas
 # que dos nodos den exactamente el mismo resultado en Quantum ESPRESSO.
 export MKL_CBWR=AUTO
+
+# Instrucciones vectoriales que MKL tiene PERMITIDO usar como maximo (nunca
+# fuerza una ruta de codigo incorrecta: solo pone un techo). En el
+# 1950X/2990WX (Zen1/Zen+, sin AVX-512) el techo real de hardware es AVX2.
+# Es el reemplazo actual de MKL_DEBUG_CPU_TYPE, que Intel desactivo hace
+# varios anios (hoy no tiene ningun efecto, por eso no se incluye aqui).
+# Aun asi, en CPUs no-Intel el beneficio no esta garantizado: Intel no
+# promete el despacho optimo fuera de sus propios procesadores.
+export MKL_ENABLE_INSTRUCTIONS=AVX2
+
+# Evita que MKL cargue su PROPIO runtime de OpenMP (libiomp5) por separado
+# del que usan gcc/gfortran (libgomp, via -fopenmp). Tener dos runtimes de
+# OpenMP activos a la vez en el mismo proceso es una causa real y conocida
+# de sobre-suscripcion de nucleos y cuelgues en codigos hibridos MPI+OpenMP
+# que llaman a MKL (como Quantum ESPRESSO). Como este cluster compila con
+# gcc/gfortran (no con los compiladores de Intel), "GNU" es la opcion
+# correcta aqui.
+export MKL_THREADING_LAYER=GNU
+
+# A PROPOSITO no se fija aqui un numero de hilos fijo para MKL
+# (MKL_NUM_THREADS / MKL_DYNAMIC=FALSE): el valor correcto depende de
+# cuantos procesos MPI por nodo uses en cada corrida (p.ej. un solo rango
+# usando todos los nucleos vs. varios rangos con pocos hilos cada uno).
+# Fijarlo aqui de forma global, igual para toda corrida, es exactamente el
+# tipo de ajuste "demasiado especifico" que puede sobre-suscribir los
+# nucleos y pisarse con el paralelismo de OpenMPI/OpenMP: ajusta
+# OMP_NUM_THREADS (y MKL_NUM_THREADS si hace falta) en el script de cada
+# trabajo especifico, no en este archivo. Por la misma razon tampoco se
+# toca MKL_INTERFACE_LAYER (LP64/ILP64): debe coincidir exactamente con
+# como se compilo/enlazo cada programa, no es algo que se pueda fijar de
+# forma general para todo el sistema.
 EOF
 )"
 

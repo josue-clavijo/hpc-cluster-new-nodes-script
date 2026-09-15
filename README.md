@@ -62,7 +62,9 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   viene incluido en `gcc`/`gfortran` (`-fopenmp`).
 - Variables de entorno (rutas del stack HPC —incluyendo el subdirectorio
   `ucx/` donde UCX carga sus modulos de transporte—, preferencia UCX de
-  OpenMPI, afinidad de nucleos para Threadripper, `MKL_CBWR=AUTO` y
+  OpenMPI, afinidad de nucleos para Threadripper, `MKL_CBWR=AUTO`,
+  `MKL_ENABLE_INSTRUCTIONS=AVX2`, `MKL_THREADING_LAYER=GNU` (evita que MKL
+  cargue su propio runtime OpenMP junto al de gcc/gfortran) y
   activacion automatica de Intel MKL/oneAPI si esta instalado) inyectadas
   al **principio** de `~/.bashrc` del usuario del cluster, antes del
   guardian que corta la ejecucion para shells no interactivas — asi
