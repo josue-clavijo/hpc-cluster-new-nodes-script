@@ -28,9 +28,9 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   vía PAM como vía `systemd` (incluyendo el servicio SSH).
 - Instalacion de la pila **RDMA/InfiniBand** (`rdma-core`, `ibverbs-utils`,
   `infiniband-diags`, `perftest`, etc.) y carga de los modulos `mlx5_core`/
-  `mlx5_ib`. Si no se detecta fisicamente la tarjeta Mellanox, el script
-  **se detiene y espera** que el usuario decida: reintentar, continuar sin
-  InfiniBand o abortar.
+  `mlx5_ib`/`ib_cm`/`ib_ucm`/etc. Si no se detecta fisicamente la tarjeta
+  Mellanox, el script **se detiene y espera** que el usuario decida:
+  reintentar, continuar sin InfiniBand o abortar.
 - Busqueda opcional, en la carpeta de descargas del usuario, de tarballs de
   **UCX, libfabric, LibXC y OpenMPI** ya descargados para compilarlos e
   instalarlos manualmente (suelen ser mas recientes/estables para RDMA que
@@ -38,13 +38,20 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   se usan los paquetes del repositorio. Todo se instala en **el mismo
   prefijo** (configurable, por defecto `/usr/local`), que debe coincidir con
   la ruta que ya usan los demas nodos del cluster para evitar conflictos.
-- Configuracion de la interfaz **IPoIB** (`ib0`) con IP estatica en modo
-  "connected" (MTU 65520).
+- Configuracion de la interfaz **IPoIB** con IP estatica en modo "connected"
+  (MTU 65520) y mascara configurable (CIDR, debe coincidir con la de los
+  demas nodos). La interfaz se detecta por `sysfs`
+  (`/sys/class/infiniband/*/device/net/`), no adivinando el nombre: funciona
+  igual si se llama `ib0` o algo como `ibp65s0` (nombres predecibles de
+  systemd/udev por bus/slot PCI).
 - Actualizacion de `/etc/hosts`, generacion de **llaves SSH** y copia hacia
   el nodo `master`.
 - Cliente **NFS** y montaje del recurso compartido (por defecto `/cluster`),
-  con arranque automatico via `rpcbind`/`remote-fs.target`, y la opcion de
-  registrar automaticamente el nodo en `/etc/exports` del maestro via SSH.
+  con arranque automatico via `rpcbind`/`remote-fs.target`, la opcion de
+  registrar automaticamente el nodo en `/etc/exports` del maestro via SSH, y
+  la opcion de montar por **NFS/RDMA** (puerto 20049, con `xprtrdma` en el
+  cliente y `svcrdma` + `echo rdma 20049 > /proc/fs/nfsd/portlist` en el
+  maestro) en vez de TCP/IPoIB normal.
 - **Directorio compartido del cluster** (dentro del propio NFS, en
   `cluster-conf/`): fusiona `/etc/hosts` y `authorized_keys` de todos los
   nodos que han pasado por el script, incluyendo el auto-registro de este
@@ -53,12 +60,17 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
 - Toolchain de compilacion y **MPI** (`build-essential`, `gfortran`,
   OpenMPI + UCX) configurado para usar InfiniBand entre nodos; OpenMP ya
   viene incluido en `gcc`/`gfortran` (`-fopenmp`).
-- Variables de entorno (rutas del stack HPC, preferencia UCX de OpenMPI,
-  afinidad de nucleos para Threadripper, activacion automatica de Intel
-  MKL si esta instalado) inyectadas al **principio** de `~/.bashrc` del
-  usuario del cluster, antes del guardian que corta la ejecucion para
-  shells no interactivas — asi tambien las ve `mpirun --host otro_nodo`
-  cuando lanza procesos remotos via SSH, no solo una terminal abierta.
+- Variables de entorno (rutas del stack HPC —incluyendo el subdirectorio
+  `ucx/` donde UCX carga sus modulos de transporte—, preferencia UCX de
+  OpenMPI, afinidad de nucleos para Threadripper, `MKL_CBWR=AUTO` y
+  activacion automatica de Intel MKL/oneAPI si esta instalado) inyectadas
+  al **principio** de `~/.bashrc` del usuario del cluster, antes del
+  guardian que corta la ejecucion para shells no interactivas — asi
+  tambien las ve `mpirun --host otro_nodo` cuando lanza procesos remotos
+  via SSH (bash detecta que lo invoca sshd y lee `.bashrc` igual, pero
+  corta justo en ese guardian si no se pone el contenido antes), no solo
+  una terminal abierta. No se activan los componentes de MPI/compilador de
+  Intel, para no chocar con OpenMPI/gcc, que es lo que usa este cluster.
 
 Al terminar, el nodo queda listo para instalar sobre esta base las
 bibliotecas de aplicacion (Intel MKL, Quantum ESPRESSO, etc.).
@@ -84,6 +96,19 @@ parametros usados en `/etc/hpc-cluster/node.conf`.
 - La tarjeta InfiniBand Mellanox ya instalada fisicamente en el nodo.
 - Conocer la IP InfiniBand que le corresponde al nuevo nodo y los datos del
   nodo `master` (hostname, IP InfiniBand, ruta NFS exportada).
+
+## Validacion
+
+Sin hardware InfiniBand real ni un maestro real, el script se corrio
+completo (con `lspci`, `modprobe`, `apt-get`, `ssh*`, `mount`, etc.
+simulados) para verificar la logica de las ramas: tarjeta ausente ->
+pregunta interactiva -> continuar sin IB; NFS sin poder montar -> el
+directorio compartido se omite en vez de fallar; llaves SSH generadas con
+los permisos correctos. Esa simulacion encontro y corrigio dos bugs reales:
+el directorio `~/.ssh` se creaba como root (700) antes de generar la llave
+como el usuario del cluster, lo que hacia fallar `ssh-keygen` por permisos;
+y si `ssh-keygen` fallaba, el script igual reportaba exito en vez de
+marcar la etapa como fallida.
 
 ## Despues de ejecutar el script
 

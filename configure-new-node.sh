@@ -55,6 +55,9 @@ STATE_FILE="${STATE_DIR}/node.conf"
 CLUSTER_USER="ryzen"
 CLUSTER_GROUP="ryzen"
 SHARED_MOUNT_POINT="/cluster"
+# Valor por defecto; se pregunta en gather_input porque DEBE coincidir con
+# la mascara que ya usan los demas nodos (una referencia real de este mismo
+# cluster mostro 255.255.0.0 = /16, no /24 -- confirma cual es la correcta).
 IB_NETMASK_CIDR="24"
 
 COLOR_RESET="\e[0m"
@@ -385,11 +388,16 @@ gather_input() {
 
     MASTER_HOSTNAME="$(ask "Nombre de host del nodo maestro" "master")"
     MASTER_IB_IP="$(ask "IP InfiniBand del nodo maestro" "10.10.10.1")"
+    IB_NETMASK_CIDR="$(ask "Mascara de la red InfiniBand en formato CIDR (24 = 255.255.255.0, 16 = 255.255.0.0). DEBE coincidir con la de los demas nodos" "${IB_NETMASK_CIDR}")"
 
     echo
     echo -e "${COLOR_BOLD}--- Recursos remotos ---${COLOR_RESET}"
     NFS_EXPORT_PATH="$(ask "Ruta exportada por NFS en el maestro" "${SHARED_MOUNT_POINT}")"
     NFS_MOUNT_POINT="$(ask "Punto de montaje local para esa carpeta compartida" "${SHARED_MOUNT_POINT}")"
+
+    DO_NFS_RDMA=false
+    info "NFS sobre RDMA (en vez de TCP/IPoIB normal) da menor latencia, pero requiere que el maestro tenga el modulo 'svcrdma' cargado y 'echo rdma 20049 > /proc/fs/nfsd/portlist' ejecutado despues de levantar nfsd."
+    confirm "¿Montar el recurso NFS usando RDMA (puerto 20049)?" "n" && DO_NFS_RDMA=true
 
     echo
     echo -e "${COLOR_BOLD}--- Cuenta de trabajo ---${COLOR_RESET}"
@@ -435,7 +443,9 @@ gather_input() {
   Nodo:                  ${NODE_NAME}
   IP InfiniBand nodo:    ${NODE_IB_IP}/${IB_NETMASK_CIDR}
   Maestro:               ${MASTER_HOSTNAME} (${MASTER_IB_IP})
+  Mascara InfiniBand:    /${IB_NETMASK_CIDR}
   NFS remoto:            ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT}
+  NFS sobre RDMA:        ${DO_NFS_RDMA}
   Usuario/grupo cluster: ${CLUSTER_USER}:${CLUSTER_GROUP}
   apt upgrade:           ${DO_APT_UPGRADE}
   Mitigaciones Ryzen:    ${DO_RYZEN_CSTATE_FIX}
@@ -642,6 +652,7 @@ EOF
 
     # Desactivar el autosuspend de USB, causa comun de "cuelgues" en nodos
     # sin monitor donde el teclado/mouse USB entra en ahorro de energia.
+    mkdir -p /etc/udev/rules.d
     cat > /etc/udev/rules.d/50-hpc-no-usb-autosuspend.rules <<'EOF'
 ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
 EOF
@@ -826,6 +837,8 @@ ib_core
 ib_uverbs
 ib_umad
 ib_ipoib
+ib_cm
+ib_ucm
 rdma_ucm
 rdma_cm
 EOF
@@ -952,15 +965,21 @@ stage_ipoib_interface() {
         return 0
     fi
 
+    # La interfaz de red asociada a la tarjeta InfiniBand no siempre se llama
+    # "ib0": con el esquema de nombres predecibles de systemd/udev puede
+    # llamarse algo como "ibp65s0" (bus/slot PCI). La forma confiable de
+    # encontrarla, sea cual sea su nombre, es mirar que netdev esta asociado
+    # al dispositivo InfiniBand en sysfs, en vez de adivinar por regex.
     local ib_iface=""
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        ib_iface="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^ib[0-9]+$' | head -n1)"
+        ib_iface="$(ls /sys/class/infiniband/*/device/net/ 2>/dev/null | head -n1)"
+        [[ -z "${ib_iface}" ]] && ib_iface="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^(ib[0-9]+|ibp[0-9]+s[0-9]+(f[0-9]+)?)$' | head -n1)"
         [[ -n "${ib_iface}" ]] && break
         sleep 1
     done
 
     if [[ -z "${ib_iface}" ]]; then
-        err "No se encontro ninguna interfaz ib* (ib0). El modulo mlx5_ib puede no haber podido inicializar la tarjeta. Revisa 'dmesg | grep -i mlx5' y 'lspci | grep -i mellanox'."
+        err "No se encontro ninguna interfaz de red asociada a un dispositivo InfiniBand. El modulo mlx5_ib puede no haber podido inicializar la tarjeta. Revisa 'dmesg | grep -i mlx5', 'lspci | grep -i mellanox' y 'ls /sys/class/infiniband/'."
         return 1
     fi
     ok "Interfaz InfiniBand detectada: ${ib_iface}"
@@ -983,6 +1002,7 @@ stage_ipoib_interface() {
     fi
 
     # Forzar modo "connected" para maximo MTU/rendimiento, de forma persistente.
+    mkdir -p /etc/udev/rules.d
     cat > /etc/udev/rules.d/60-hpc-ipoib-mode.rules <<EOF
 ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="${ib_iface}", RUN+="/bin/sh -c 'echo connected > /sys/class/net/%k/mode; echo 65520 > /sys/class/net/%k/mtu'"
 EOF
@@ -1030,10 +1050,20 @@ stage_ssh_keys() {
 
     mkdir -p "${ssh_dir}"
     chmod 700 "${ssh_dir}"
+    # Ojo con el orden: mkdir/chmod se ejecutan como root, asi que el
+    # directorio queda dueno de root con permisos 700 (nadie mas puede
+    # entrar). Hay que darle el directorio al usuario del cluster ANTES de
+    # invocar "sudo -u ... ssh-keygen", o ese comando falla por permisos al
+    # intentar escribir alli.
+    chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${ssh_dir}"
 
     if [[ ! -f "${ssh_dir}/id_ed25519" ]]; then
-        sudo -u "${CLUSTER_USER}" ssh-keygen -t ed25519 -N "" -f "${ssh_dir}/id_ed25519" -C "${CLUSTER_USER}@${NODE_NAME}"
-        ok "Par de llaves SSH generado para ${CLUSTER_USER}."
+        if sudo -u "${CLUSTER_USER}" ssh-keygen -t ed25519 -N "" -f "${ssh_dir}/id_ed25519" -C "${CLUSTER_USER}@${NODE_NAME}"; then
+            ok "Par de llaves SSH generado para ${CLUSTER_USER}."
+        else
+            err "No se pudo generar el par de llaves SSH para ${CLUSTER_USER} (¿falta 'openssh-client'?)."
+            return 1
+        fi
     else
         info "Ya existe un par de llaves SSH para ${CLUSTER_USER}, se reutiliza."
     fi
@@ -1087,7 +1117,18 @@ stage_nfs_client() {
 
     mkdir -p "${NFS_MOUNT_POINT}"
 
-    local fstab_line="${MASTER_HOSTNAME}:${NFS_EXPORT_PATH}  ${NFS_MOUNT_POINT}  nfs  defaults,_netdev,noatime,rsize=1048576,wsize=1048576  0  0"
+    local nfs_opts="defaults,_netdev,noatime,rsize=1048576,wsize=1048576"
+    if [[ "${DO_NFS_RDMA}" == true ]]; then
+        # xprtrdma es el modulo cliente que permite montar por RDMA en vez
+        # de TCP/IPoIB; en el maestro (servidor) se necesita "svcrdma" y
+        # 'echo rdma 20049 > /proc/fs/nfsd/portlist' (ver etapa de exports).
+        modprobe xprtrdma 2>>"${LOG_FILE}" && info "Modulo cargado: xprtrdma" || warn "No se pudo cargar xprtrdma; el montaje por RDMA probablemente fallara."
+        append_once /etc/modules-load.d/hpc-infiniband.conf "xprtrdma"
+        nfs_opts="_netdev,noatime,rsize=1048576,wsize=1048576,rdma,port=20049"
+        info "Montando por NFS/RDMA (puerto 20049)."
+    fi
+
+    local fstab_line="${MASTER_HOSTNAME}:${NFS_EXPORT_PATH}  ${NFS_MOUNT_POINT}  nfs  ${nfs_opts}  0  0"
     backup_file /etc/fstab
     if ! grep -qF "${MASTER_HOSTNAME}:${NFS_EXPORT_PATH}" /etc/fstab; then
         echo "${fstab_line}" >> /etc/fstab
@@ -1207,6 +1248,18 @@ a /etc/exports y luego ejecuta 'sudo exportfs -ra':
   ${NFS_EXPORT_PATH}  ${NODE_IB_IP}(rw,sync,no_subtree_check,no_root_squash)
 
 EOF
+        if [[ "${DO_NFS_RDMA}" == true ]]; then
+            cat <<EOF
+Para que el maestro tambien acepte NFS por RDMA, en el MAESTRO:
+
+  sudo modprobe svcrdma
+  sudo sh -c 'echo rdma 20049 > /proc/fs/nfsd/portlist'
+
+(despues de que nfs-kernel-server ya este arriba; conviene dejarlo tambien
+en un servicio/udev rule para que se repita en cada arranque del maestro).
+
+EOF
+        fi
         return 0
     fi
 
@@ -1217,6 +1270,15 @@ EOF
         ok "El maestro ahora exporta ${NFS_EXPORT_PATH} para ${NODE_IB_IP}."
     else
         warn "No se pudo modificar /etc/exports en el maestro automaticamente (¿el usuario ${CLUSTER_USER} tiene sudo alli y la llave SSH quedo instalada?). Hazlo manualmente con la linea mostrada arriba."
+    fi
+
+    if [[ "${DO_NFS_RDMA}" == true ]]; then
+        local rdma_cmd="sudo modprobe svcrdma; grep -qF '20049' /proc/fs/nfsd/portlist 2>/dev/null || sudo sh -c 'echo rdma 20049 > /proc/fs/nfsd/portlist'"
+        if sudo -u "${CLUSTER_USER}" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${CLUSTER_USER}@${MASTER_IB_IP}" "${rdma_cmd}" 2>&1 | tee -a "${LOG_FILE}"; then
+            ok "El maestro quedo escuchando NFS/RDMA en el puerto 20049."
+        else
+            warn "No se pudo activar NFS/RDMA en el maestro automaticamente. Hazlo manualmente alli: 'sudo modprobe svcrdma' y 'echo rdma 20049 | sudo tee /proc/fs/nfsd/portlist' (con nfs-kernel-server ya arrancado)."
+        fi
     fi
 }
 
@@ -1266,11 +1328,19 @@ stage_bashrc_environment() {
 
     local env_block
     env_block="$(cat <<EOF
-# Rutas del stack HPC (UCX/OpenMPI/libfabric/LibXC) compiladas manualmente.
-# Este prefijo debe ser IGUAL en todos los nodos del cluster.
+# Rutas del stack HPC (UCX/OpenMPI/libfabric/LibXC). Este prefijo debe ser
+# IGUAL en todos los nodos del cluster.
 export HPC_PREFIX="${HPC_INSTALL_PREFIX}"
 export PATH="\${HPC_PREFIX}/bin:\${PATH}"
-export LD_LIBRARY_PATH="\${HPC_PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
+# LIBRARY_PATH es lo que usa gcc/gfortran en tiempo de COMPILACION/enlace
+# para encontrar -lucx, -lfabric, etc. sin necesitar -L explicito.
+export LIBRARY_PATH="\${HPC_PREFIX}/lib:\${LIBRARY_PATH:-}"
+# UCX carga sus modulos de transporte (verbs, shared memory, etc.) desde un
+# subdirectorio "ucx/" propio, no solo desde el lib/ general; si no esta en
+# el path puede perder silenciosamente el soporte de InfiniBand y caer a
+# TCP. Se incluyen ambas rutas (la del stack compilado y la del paquete
+# libucx0 de Ubuntu/Mint) para cubrir los dos casos.
+export LD_LIBRARY_PATH="\${HPC_PREFIX}/lib:\${HPC_PREFIX}/lib/ucx:/usr/lib/ucx:\${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="\${HPC_PREFIX}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
 
 # MPI sobre InfiniBand: preferir UCX (usa los verbs de Mellanox/mlx5) entre
@@ -1289,19 +1359,35 @@ export OMP_PLACES=cores
 export OMPI_MCA_hwloc_base_binding_policy=core
 
 # Intel MKL / oneAPI: se activa solo si ya esta instalado (lo instalas tu
-# mismo mas adelante junto con Quantum ESPRESSO).
-if [ -f /opt/intel/oneapi/setvars.sh ]; then
+# mismo mas adelante junto con Quantum ESPRESSO). Se prueba primero la ruta
+# especifica del componente MKL (mas liviana) y se cae al setvars.sh general
+# solo si no existe; NUNCA se activan los componentes de MPI/compilador de
+# Intel para no chocar con OpenMPI/gcc, que es lo que usa este cluster.
+if [ -f /opt/intel/oneapi/mkl/latest/env/vars.sh ]; then
+    source /opt/intel/oneapi/mkl/latest/env/vars.sh > /dev/null 2>&1
+elif [ -f /opt/intel/oneapi/setvars.sh ]; then
+    # Respaldo: activa todo oneAPI (incluye MPI/compiladores de Intel si
+    # estan instalados). Si eso llega a chocar con OpenMPI/gcc en el PATH,
+    # instala solo el componente MKL para que la rama de arriba lo detecte.
     source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1
 elif [ -f /opt/intel/mkl/bin/mklvars.sh ]; then
     source /opt/intel/mkl/bin/mklvars.sh intel64 > /dev/null 2>&1
 fi
+
+# MKL_CBWR (Conditional Bitwise Reproducibility, antes llamado "CNR"): fuerza
+# a MKL a usar siempre la MISMA ruta de codigo en vez de la que el CPU
+# detecte en cada corrida, para que dos ejecuciones (incluso en nodos
+# distintos) den resultados numericamente identicos bit a bit. AUTO deja
+# que MKL elija la ruta optima sin forzar reproducibilidad (equivalente a
+# tenerlo desactivado); cambialo a un valor fijo (p.ej. AVX2) si necesitas
+# que dos nodos den exactamente el mismo resultado en Quantum ESPRESSO.
+export MKL_CBWR=AUTO
 EOF
 )"
 
     inject_bashrc_block "${bashrc_file}" "${env_block}"
     chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${bashrc_file}"
     ok "Bloque de entorno insertado al PRINCIPIO de ${bashrc_file} (antes del guardian de shells no interactivas), para que tanto una terminal como 'mpirun ... --host otro_nodo' via SSH vean las mismas rutas."
-    warn "Nota: no reconozco el termino 'CBRW' que mencionaste para afinidad de nucleos en Threadripper; en su lugar aplique las optimizaciones documentadas por la comunidad (afinidad OMP_PROC_BIND/OMP_PLACES, binding de OpenMPI por core, y el override de ACS de PCIe si lo activaste). Si tenias en mente un ajuste especifico con otro nombre, dimelo y lo agrego."
 }
 
 # ============================================================================
@@ -1315,9 +1401,9 @@ final_summary() {
     echo "Resumen de red InfiniBand:"
     echo "  Tarjeta detectada: ${IB_CARD_PRESENT}"
     echo "  Interfaz:        ${IB_IFACE:-no detectada}"
-    echo "  IP de este nodo: ${NODE_IB_IP}"
+    echo "  IP de este nodo: ${NODE_IB_IP}/${IB_NETMASK_CIDR}"
     echo "  Maestro:         ${MASTER_HOSTNAME} (${MASTER_IB_IP})"
-    echo "  Recurso NFS:     ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT}"
+    echo "  Recurso NFS:     ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT} $([[ "${DO_NFS_RDMA}" == true ]] && echo "(RDMA, puerto 20049)" || echo "(TCP)")"
     echo
     echo "Bibliotecas HPC (prefijo comun: ${HPC_INSTALL_PREFIX}):"
     echo "  UCX:       $([[ "${UCX_BUILT_FROM_SOURCE}" == true ]] && echo "compilado en ${HPC_INSTALL_PREFIX}" || echo "repositorio")"
