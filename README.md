@@ -10,7 +10,9 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
 
 - Usuario/grupo estandar (`ryzen`/`ryzen` por defecto) con **autologin** en LightDM.
 - Ajustes de **Cinnamon** para que nunca se suspenda, bloquee ni active
-  salvapantallas/DPMS.
+  salvapantallas/DPMS. La interfaz grafica en si **nunca se desactiva**
+  (se garantiza `graphical.target` + LightDM habilitados): queda disponible
+  para monitorear el nodo localmente mientras trabaja el cluster.
 - Desactivacion de suspension/hibernacion a nivel de `systemd`/`logind` y
   del autosuspend de USB.
 - **Gobernador de CPU en `performance`** de forma persistente y, de forma
@@ -21,7 +23,14 @@ pensado para **Linux Mint Cinnamon** (base Ubuntu).
   vía PAM como vía `systemd` (incluyendo el servicio SSH).
 - Instalacion de la pila **RDMA/InfiniBand** (`rdma-core`, `ibverbs-utils`,
   `infiniband-diags`, `perftest`, etc.) y carga de los modulos `mlx5_core`/
-  `mlx5_ib`.
+  `mlx5_ib`. Si no se detecta fisicamente la tarjeta Mellanox, el script
+  **se detiene y espera** que el usuario decida: reintentar, continuar sin
+  InfiniBand o abortar.
+- Busqueda opcional, en la carpeta de descargas del usuario, de tarballs de
+  **UCX, libfabric, LibXC y OpenMPI** ya descargados para compilarlos e
+  instalarlos manualmente (suelen ser mas recientes/estables para RDMA que
+  los paquetes de Mint/Ubuntu); si no se encuentran o el usuario no lo pide,
+  se usan los paquetes del repositorio.
 - Configuracion de la interfaz **IPoIB** (`ib0`) con IP estatica en modo
   "connected" (MTU 65520).
 - Actualizacion de `/etc/hosts`, generacion de **llaves SSH** y copia hacia

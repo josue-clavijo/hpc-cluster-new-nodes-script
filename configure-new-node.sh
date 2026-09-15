@@ -18,18 +18,21 @@
 #   2) Recoleccion de parametros (interactivo)
 #   3) Actualizacion del sistema
 #   4) Usuario/grupo "ryzen" + autologin (LightDM)
-#   5) Estabilidad de Cinnamon (sin bloqueos, sin suspension, sin salvapantallas)
+#   5) Estabilidad de Cinnamon (sin bloqueos/suspension/salvapantallas; la
+#      interfaz grafica en si NUNCA se desactiva, queda lista para monitoreo)
 #   6) Desactivar suspension/hibernacion a nivel de systemd/logind
 #   7) Estados C / gobernador de CPU (estabilidad para AMD Ryzen)
 #   8) Limites de memoria (memlock, nofile) para RDMA
-#   9) Paquetes RDMA/InfiniBand + modulos mlx5
-#  10) Interfaz IPoIB (ib0) con IP estatica
-#  11) /etc/hosts del cluster
-#  12) Llaves SSH hacia/desde el nodo master
-#  13) Cliente NFS + montaje de /cluster
-#  14) (Opcional) registrar el nodo en /etc/exports del master via SSH
-#  15) Toolchain MPI/OpenMP (OpenMPI + UCX + build-essential)
-#  16) Resumen final
+#   9) Paquetes RDMA/InfiniBand + modulos mlx5 (se detiene y espera input del
+#      usuario si no detecta fisicamente la tarjeta)
+#  10) Bibliotecas HPC desde paquetes descargados (UCX/libfabric/LibXC/OpenMPI)
+#  11) Interfaz IPoIB (ib0) con IP estatica
+#  12) /etc/hosts del cluster
+#  13) Llaves SSH hacia/desde el nodo master
+#  14) Cliente NFS + montaje de /cluster
+#  15) (Opcional) registrar el nodo en /etc/exports del master via SSH
+#  16) Toolchain MPI/OpenMP (OpenMPI + UCX + build-essential)
+#  17) Resumen final
 #
 set -uo pipefail
 
@@ -59,6 +62,14 @@ FAILED_STEPS=()
 SKIPPED_STEPS=()
 SSH_TRUST_OK=false
 IB_IFACE=""
+IB_CARD_PRESENT=true
+DOWNLOADS_DIR=""
+DO_CHECK_DOWNLOADS=false
+HPC_STACK_PREFIX="/opt/hpc-stack"
+UCX_PREFIX=""
+LIBFABRIC_PREFIX=""
+LIBXC_PREFIX=""
+OPENMPI_BUILT_FROM_SOURCE=false
 
 log() {
     local msg="$1"
@@ -170,6 +181,93 @@ pkg_install() {
     return 0
 }
 
+wait_for_ib_card() {
+    # Se detiene y espera input del usuario mientras no se detecte
+    # fisicamente la tarjeta Mellanox/InfiniBand por PCI, en vez de asumir
+    # que no esta y seguir de largo.
+    while true; do
+        if lspci | grep -qi mellanox; then
+            ok "Tarjeta Mellanox detectada por PCI:"
+            lspci | grep -i mellanox | tee -a "${LOG_FILE}"
+            IB_CARD_PRESENT=true
+            return 0
+        fi
+
+        warn "No se detecto ninguna tarjeta Mellanox/InfiniBand por PCI (lspci)."
+        echo
+        echo "  [r] Reintentar deteccion (revisa que la tarjeta este bien asentada en el slot PCIe/riser y con alimentacion, luego reintenta)"
+        echo "  [c] Continuar sin InfiniBand (se omitiran los pasos de red IPoIB; el resto del nodo se configura igual)"
+        echo "  [a] Abortar la configuracion de este nodo"
+        local choice
+        choice="$(ask "¿Que deseas hacer?" "r")"
+        case "${choice,,}" in
+            r|reintentar|retry) continue ;;
+            c|continuar|continue) IB_CARD_PRESENT=false; warn "Continuando sin tarjeta InfiniBand detectada."; return 0 ;;
+            a|abortar|abort) err "Configuracion abortada por el usuario."; exit 1 ;;
+            *) warn "Opcion no reconocida ('${choice}'). Escribe 'r', 'c' o 'a'." ;;
+        esac
+    done
+}
+
+find_downloaded_archive() {
+    # find_downloaded_archive <carpeta> <palabra_clave> -> ruta del tarball
+    # mas reciente que coincida, o vacio si no hay ninguno.
+    local dir="$1" keyword="$2"
+    [[ -d "${dir}" ]] || return 0
+    find "${dir}" -maxdepth 1 -iname "*${keyword}*" \( -iname "*.tar.gz" -o -iname "*.tar.bz2" -o -iname "*.tar.xz" -o -iname "*.tgz" \) 2>/dev/null | sort | tail -n1
+}
+
+build_from_source() {
+    # build_from_source <nombre> <tarball> <prefix> [args extra de configure/cmake]
+    # Detecta automaticamente si el proyecto usa autotools (./configure) o
+    # CMake (CMakeLists.txt) y compila/instala en <prefix>.
+    local name="$1" tarball="$2" prefix="$3"; shift 3
+    local extra_args=("$@")
+    local build_root="/usr/local/src/hpc-build"
+    mkdir -p "${build_root}"
+    local extract_dir
+    extract_dir="$(mktemp -d "${build_root}/${name}.XXXXXX")"
+
+    info "${name}: extrayendo $(basename "${tarball}") en ${extract_dir}..."
+    if ! tar -xf "${tarball}" -C "${extract_dir}" --strip-components=1 2>>"${LOG_FILE}"; then
+        err "${name}: no se pudo extraer ${tarball}."
+        return 1
+    fi
+
+    pushd "${extract_dir}" >/dev/null || return 1
+    local status=0
+    if [[ -x ./configure ]]; then
+        info "${name}: configurando (autotools, prefix=${prefix})..."
+        ./configure --prefix="${prefix}" "${extra_args[@]}" 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        if [[ "${status}" -eq 0 ]]; then
+            info "${name}: compilando (make -j$(nproc))..."
+            make -j"$(nproc)" 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        fi
+        if [[ "${status}" -eq 0 ]]; then
+            info "${name}: instalando en ${prefix}..."
+            make install 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        fi
+    elif [[ -f ./CMakeLists.txt ]]; then
+        info "${name}: configurando (CMake, prefix=${prefix})..."
+        mkdir -p build && cd build || { popd >/dev/null; return 1; }
+        cmake .. -DCMAKE_INSTALL_PREFIX="${prefix}" "${extra_args[@]}" 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        if [[ "${status}" -eq 0 ]]; then
+            info "${name}: compilando (make -j$(nproc))..."
+            make -j"$(nproc)" 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        fi
+        if [[ "${status}" -eq 0 ]]; then
+            info "${name}: instalando en ${prefix}..."
+            make install 2>&1 | tee -a "${LOG_FILE}"; status="${PIPESTATUS[0]}"
+        fi
+    else
+        err "${name}: no se encontro 'configure' ni 'CMakeLists.txt'; no se puede compilar automaticamente."
+        popd >/dev/null
+        return 1
+    fi
+    popd >/dev/null
+    return "${status}"
+}
+
 trap 'err "Interrumpido por el usuario (Ctrl+C)."; exit 130' INT
 
 # ============================================================================
@@ -256,6 +354,15 @@ gather_input() {
     confirm "¿Configurar y montar el recurso NFS compartido ahora?" "s" || DO_MOUNT_NFS=false
 
     echo
+    echo -e "${COLOR_BOLD}--- Bibliotecas HPC desde paquetes descargados (opcional) ---${COLOR_RESET}"
+    info "Si ya descargaste los .tar.gz/.tar.bz2/.tar.xz de UCX, OpenMPI, libfabric y/o LibXC (suelen ser mas recientes y estables para RDMA que los del repositorio de Mint/Ubuntu), el script puede compilarlos e instalarlos en vez de usar esos paquetes del repositorio."
+    DO_CHECK_DOWNLOADS=false
+    confirm "¿Buscar esos paquetes descargados y ofrecer compilarlos?" "s" && DO_CHECK_DOWNLOADS=true
+    if [[ "${DO_CHECK_DOWNLOADS}" == true ]]; then
+        DOWNLOADS_DIR="$(ask "Carpeta donde estan los paquetes descargados" "/home/${CLUSTER_USER}/Descargas")"
+    fi
+
+    echo
     echo -e "${COLOR_BOLD}--- Resumen ---${COLOR_RESET}"
     cat <<EOF
   Nodo:                  ${NODE_NAME}
@@ -268,6 +375,7 @@ gather_input() {
   Copiar llave a master: ${DO_SSH_COPY_TO_MASTER}
   Editar exports remoto: ${DO_REMOTE_EXPORTS}
   Montar NFS:            ${DO_MOUNT_NFS}
+  Buscar libs descargadas: ${DO_CHECK_DOWNLOADS} ${DOWNLOADS_DIR:+(${DOWNLOADS_DIR})}
 EOF
     echo
     confirm "¿Continuar con esta configuracion?" "s" || { info "Cancelado por el usuario."; exit 0; }
@@ -350,6 +458,16 @@ EOF
 
 stage_cinnamon_stability() {
     step "Ajustando Cinnamon para maxima estabilidad (sin suspension ni bloqueo)"
+
+    # Importante: aqui SOLO se desactivan suspension/bloqueo/salvapantallas.
+    # La interfaz grafica Cinnamon se deja siempre activa (nunca se cambia a
+    # modo texto/headless) porque se necesita para monitorear el nodo
+    # localmente mientras trabaja el cluster.
+    systemctl set-default graphical.target 2>&1 | tee -a "${LOG_FILE}" || true
+    if command -v lightdm >/dev/null 2>&1 || dpkg -l | grep -qi lightdm; then
+        systemctl enable lightdm 2>&1 | tee -a "${LOG_FILE}" || true
+    fi
+    ok "Interfaz grafica Cinnamon garantizada activa (graphical.target + lightdm habilitados) para monitoreo local del nodo."
 
     if ! command -v dconf >/dev/null 2>&1; then
         warn "'dconf' no esta instalado; instalando..."
@@ -626,19 +744,115 @@ EOF
     systemctl enable --now rdma-load-modules@rdma.service 2>&1 | tee -a "${LOG_FILE}" || true
     systemctl enable --now rdma-ndd 2>&1 | tee -a "${LOG_FILE}" || true
 
-    if lspci | grep -qi mellanox; then
-        ok "Tarjeta Mellanox detectada por PCI:"
-        lspci | grep -i mellanox | tee -a "${LOG_FILE}"
-    else
-        warn "No se detecto ninguna tarjeta Mellanox por PCI. Verifica que este bien conectada/asentada en el slot."
+    # Si no se detecta fisicamente la tarjeta, el script se detiene aqui y
+    # espera que el usuario decida (reintentar tras revisarla, continuar sin
+    # InfiniBand, o abortar) en vez de asumir silenciosamente que no esta.
+    wait_for_ib_card
+
+    if [[ "${IB_CARD_PRESENT}" == true ]]; then
+        if ibv_devices >/dev/null 2>&1; then
+            info "Dispositivos verbs disponibles:"
+            ibv_devices | tee -a "${LOG_FILE}"
+        else
+            warn "El comando 'ibv_devices' no listo ningun dispositivo todavia. Puede requerir un reinicio para que el driver mlx5 tome el control completo de la tarjeta."
+        fi
+    fi
+}
+
+# ============================================================================
+# 9b. Bibliotecas HPC desde paquetes descargados (UCX/libfabric/LibXC/OpenMPI)
+# ============================================================================
+
+stage_custom_hpc_libraries() {
+    step "Bibliotecas HPC desde paquetes descargados (UCX/libfabric/LibXC/OpenMPI)"
+
+    if [[ "${DO_CHECK_DOWNLOADS}" != true ]]; then
+        info "Se omitio la busqueda de paquetes descargados; el toolchain MPI se instalara desde el repositorio mas adelante."
+        return 0
     fi
 
-    if ibv_devices >/dev/null 2>&1; then
-        info "Dispositivos verbs disponibles:"
-        ibv_devices | tee -a "${LOG_FILE}"
-    else
-        warn "El comando 'ibv_devices' no listo ningun dispositivo todavia. Puede requerir un reinicio para que el driver mlx5 tome el control completo de la tarjeta."
+    local downloads_dir="${DOWNLOADS_DIR}"
+    if [[ ! -d "${downloads_dir}" ]]; then
+        for alt in "/home/${CLUSTER_USER}/Descargas" "/home/${CLUSTER_USER}/Downloads"; do
+            [[ -d "${alt}" ]] && { downloads_dir="${alt}"; break; }
+        done
     fi
+    if [[ ! -d "${downloads_dir}" ]]; then
+        warn "No se encontro la carpeta de descargas '${DOWNLOADS_DIR}'. Se omite esta etapa; el toolchain MPI se instalara desde el repositorio."
+        return 0
+    fi
+    info "Buscando paquetes en: ${downloads_dir}"
+
+    pkg_install build-essential gfortran automake autoconf libtool pkg-config cmake
+
+    local ucx_tar
+    ucx_tar="$(find_downloaded_archive "${downloads_dir}" "ucx")"
+    if [[ -n "${ucx_tar}" ]] && confirm "Se encontro '$(basename "${ucx_tar}")'. ¿Compilarlo e instalarlo en vez del UCX del repositorio?" "s"; then
+        if build_from_source "UCX" "${ucx_tar}" "${HPC_STACK_PREFIX}/ucx" --with-verbs; then
+            UCX_PREFIX="${HPC_STACK_PREFIX}/ucx"
+            ok "UCX compilado e instalado en ${UCX_PREFIX}."
+        else
+            warn "Fallo la compilacion de UCX; se usara el paquete del repositorio para OpenMPI."
+        fi
+    fi
+
+    local ofi_tar
+    ofi_tar="$(find_downloaded_archive "${downloads_dir}" "libfabric")"
+    if [[ -n "${ofi_tar}" ]] && confirm "Se encontro '$(basename "${ofi_tar}")'. ¿Compilarlo e instalarlo (proveedor OFI/libfabric alternativo para OpenMPI)?" "s"; then
+        if build_from_source "libfabric" "${ofi_tar}" "${HPC_STACK_PREFIX}/libfabric" --enable-verbs; then
+            LIBFABRIC_PREFIX="${HPC_STACK_PREFIX}/libfabric"
+            ok "libfabric compilado e instalado en ${LIBFABRIC_PREFIX}."
+        else
+            warn "Fallo la compilacion de libfabric; se omite (OpenMPI seguira usando UCX/verbs)."
+        fi
+    fi
+
+    local libxc_tar
+    libxc_tar="$(find_downloaded_archive "${downloads_dir}" "libxc")"
+    if [[ -n "${libxc_tar}" ]] && confirm "Se encontro '$(basename "${libxc_tar}")'. ¿Compilarlo e instalarlo (lo usara luego Quantum ESPRESSO)?" "s"; then
+        if build_from_source "LibXC" "${libxc_tar}" "${HPC_STACK_PREFIX}/libxc"; then
+            LIBXC_PREFIX="${HPC_STACK_PREFIX}/libxc"
+            ok "LibXC compilado e instalado en ${LIBXC_PREFIX}."
+        else
+            warn "Fallo la compilacion de LibXC; se puede instalar mas adelante junto con Quantum ESPRESSO."
+        fi
+    fi
+
+    local ompi_tar
+    ompi_tar="$(find_downloaded_archive "${downloads_dir}" "openmpi")"
+    if [[ -n "${ompi_tar}" ]] && confirm "Se encontro '$(basename "${ompi_tar}")'. ¿Compilarlo e instalarlo usando el UCX/libfabric recien compilados (recomendado para InfiniBand)?" "s"; then
+        local ompi_args=(--with-verbs)
+        [[ -n "${UCX_PREFIX}" ]] && ompi_args+=(--with-ucx="${UCX_PREFIX}")
+        [[ -n "${LIBFABRIC_PREFIX}" ]] && ompi_args+=(--with-ofi="${LIBFABRIC_PREFIX}")
+        if build_from_source "OpenMPI" "${ompi_tar}" "${HPC_STACK_PREFIX}/openmpi" "${ompi_args[@]}"; then
+            OPENMPI_BUILT_FROM_SOURCE=true
+            ok "OpenMPI compilado e instalado en ${HPC_STACK_PREFIX}/openmpi."
+        else
+            warn "Fallo la compilacion de OpenMPI; se usara el paquete openmpi-bin del repositorio."
+        fi
+    elif [[ -n "${UCX_PREFIX}" || -n "${LIBFABRIC_PREFIX}" ]]; then
+        warn "Se compilaron UCX/libfabric manualmente pero OpenMPI se instalara desde el repositorio y no aprovechara esas bibliotecas. Si quieres que las use, descarga tambien el tarball de OpenMPI y vuelve a ejecutar el script."
+    fi
+
+    if [[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]]; then
+        cat > /etc/profile.d/hpc-stack.sh <<EOF
+# Entorno para la pila HPC compilada manualmente (mas reciente/estable que
+# los paquetes del repositorio), instalada en ${HPC_STACK_PREFIX}.
+export PATH="${HPC_STACK_PREFIX}/openmpi/bin:\${PATH}"
+export LD_LIBRARY_PATH="${HPC_STACK_PREFIX}/openmpi/lib:${UCX_PREFIX:+${UCX_PREFIX}/lib:}${LIBFABRIC_PREFIX:+${LIBFABRIC_PREFIX}/lib:}\${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="${HPC_STACK_PREFIX}/openmpi/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
+EOF
+        chmod 644 /etc/profile.d/hpc-stack.sh
+        ldconfig
+        ok "Variables de entorno para la pila HPC compilada publicadas en /etc/profile.d/hpc-stack.sh"
+    fi
+
+    {
+        echo "UCX_PREFIX=${UCX_PREFIX}"
+        echo "LIBFABRIC_PREFIX=${LIBFABRIC_PREFIX}"
+        echo "LIBXC_PREFIX=${LIBXC_PREFIX}"
+        echo "OPENMPI_BUILT_FROM_SOURCE=${OPENMPI_BUILT_FROM_SOURCE}"
+    } >> "${STATE_FILE}"
 }
 
 # ============================================================================
@@ -647,6 +861,11 @@ EOF
 
 stage_ipoib_interface() {
     step "Configurando interfaz IPoIB con IP estatica ${NODE_IB_IP}/${IB_NETMASK_CIDR}"
+
+    if [[ "${IB_CARD_PRESENT}" != true ]]; then
+        warn "Se omite la configuracion de IPoIB porque no se detecto la tarjeta InfiniBand. Vuelve a ejecutar este script cuando la tarjeta este instalada."
+        return 0
+    fi
 
     local ib_iface=""
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -736,8 +955,8 @@ stage_ssh_keys() {
     chown -R "${CLUSTER_USER}:${CLUSTER_GROUP}" "${ssh_dir}"
 
     touch "${ssh_dir}/known_hosts"
-    ssh-keyscan -H "${MASTER_IB_IP}" >> "${ssh_dir}/known_hosts" 2>/dev/null
-    ssh-keyscan -H "${MASTER_HOSTNAME}" >> "${ssh_dir}/known_hosts" 2>/dev/null
+    timeout 10 ssh-keyscan -H "${MASTER_IB_IP}" >> "${ssh_dir}/known_hosts" 2>/dev/null
+    timeout 10 ssh-keyscan -H "${MASTER_HOSTNAME}" >> "${ssh_dir}/known_hosts" 2>/dev/null
     sort -u -o "${ssh_dir}/known_hosts" "${ssh_dir}/known_hosts"
     chown "${CLUSTER_USER}:${CLUSTER_GROUP}" "${ssh_dir}/known_hosts"
     ok "known_hosts actualizado con la llave del maestro."
@@ -749,7 +968,7 @@ stage_ssh_keys() {
 
     if [[ "${DO_SSH_COPY_TO_MASTER}" == true ]]; then
         info "Copiando la llave publica al maestro (se te pedira la contrasena de ${CLUSTER_USER}@${MASTER_HOSTNAME})..."
-        if sudo -u "${CLUSTER_USER}" ssh-copy-id -i "${ssh_dir}/id_ed25519.pub" -o StrictHostKeyChecking=accept-new "${CLUSTER_USER}@${MASTER_IB_IP}"; then
+        if sudo -u "${CLUSTER_USER}" ssh-copy-id -i "${ssh_dir}/id_ed25519.pub" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${CLUSTER_USER}@${MASTER_IB_IP}"; then
             ok "Llave copiada al maestro correctamente."
             SSH_TRUST_OK=true
         else
@@ -820,7 +1039,7 @@ EOF
     local export_line="${NFS_EXPORT_PATH} ${NODE_IB_IP}(rw,sync,no_subtree_check,no_root_squash)"
     local remote_cmd="grep -qF '${NODE_IB_IP}' /etc/exports 2>/dev/null || echo '${export_line}' | sudo tee -a /etc/exports >/dev/null; sudo exportfs -ra"
 
-    if sudo -u "${CLUSTER_USER}" ssh -o StrictHostKeyChecking=accept-new "${CLUSTER_USER}@${MASTER_IB_IP}" "${remote_cmd}" 2>&1 | tee -a "${LOG_FILE}"; then
+    if sudo -u "${CLUSTER_USER}" ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${CLUSTER_USER}@${MASTER_IB_IP}" "${remote_cmd}" 2>&1 | tee -a "${LOG_FILE}"; then
         ok "El maestro ahora exporta ${NFS_EXPORT_PATH} para ${NODE_IB_IP}."
     else
         warn "No se pudo modificar /etc/exports en el maestro automaticamente (¿el usuario ${CLUSTER_USER} tiene sudo alli y la llave SSH quedo instalada?). Hazlo manualmente con la linea mostrada arriba."
@@ -835,39 +1054,42 @@ stage_mpi_toolchain() {
     step "Instalando toolchain de compilacion y MPI (OpenMPI + UCX + OpenMP)"
 
     # gcc/g++/gfortran ya traen soporte de OpenMP (-fopenmp); no requieren
-    # un paquete aparte. OpenMPI es el que habilita la comunicacion entre
-    # nodos (y usara los verbs de InfiniBand automaticamente si UCX/ibverbs
-    # estan presentes).
-    pkg_install \
-        build-essential \
-        gfortran \
-        cmake \
-        pkg-config \
-        openmpi-bin \
-        openmpi-common \
-        libopenmpi-dev \
-        libucx0 \
-        libucx-dev \
-        ucx-utils \
-        environment-modules
+    # un paquete aparte.
+    pkg_install build-essential gfortran cmake pkg-config environment-modules
 
-    mkdir -p /etc/openmpi
-    cat > /etc/openmpi/openmpi-mca-params.conf <<'EOF'
+    if [[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]]; then
+        info "OpenMPI ya fue compilado desde el tarball descargado (etapa anterior) en ${HPC_STACK_PREFIX}/openmpi; se omiten los paquetes openmpi-bin/libucx del repositorio para evitar que convivan dos instalaciones distintas."
+        hash -r
+    else
+        # OpenMPI es el que habilita la comunicacion entre nodos (y usara los
+        # verbs de InfiniBand automaticamente si UCX/ibverbs estan presentes).
+        pkg_install openmpi-bin openmpi-common libopenmpi-dev libucx0 libucx-dev ucx-utils
+
+        mkdir -p /etc/openmpi
+        cat > /etc/openmpi/openmpi-mca-params.conf <<'EOF'
 # Preferir UCX (que a su vez usa los verbs de Mellanox/mlx5) para el
 # transporte entre nodos; usar memoria compartida dentro de un mismo nodo.
 pml = ucx
 btl = self,vader
 osc = ucx
 EOF
-    ok "OpenMPI configurado para preferir UCX/InfiniBand entre nodos."
+        ok "OpenMPI (repositorio) configurado para preferir UCX/InfiniBand entre nodos."
 
-    cat > /etc/profile.d/hpc-mpi.sh <<'EOF'
+        cat > /etc/profile.d/hpc-mpi.sh <<'EOF'
 # Entorno MPI/InfiniBand para todos los usuarios del cluster.
 export OMPI_MCA_pml=ucx
 export OMPI_MCA_btl=self,vader
 EOF
-    chmod 644 /etc/profile.d/hpc-mpi.sh
-    ok "Variables de entorno MPI publicadas en /etc/profile.d/hpc-mpi.sh"
+        chmod 644 /etc/profile.d/hpc-mpi.sh
+        ok "Variables de entorno MPI publicadas en /etc/profile.d/hpc-mpi.sh"
+    fi
+
+    if [[ -n "${LIBXC_PREFIX}" ]]; then
+        info "LibXC ya esta compilado en ${LIBXC_PREFIX}, listo para cuando instales Quantum ESPRESSO."
+    elif apt-cache show libxc-dev >/dev/null 2>&1; then
+        pkg_install libxc-dev
+        info "libxc-dev instalado desde el repositorio como base minima para Quantum ESPRESSO."
+    fi
 
     if command -v mpirun >/dev/null 2>&1; then
         info "$(mpirun --version | head -n1)"
@@ -883,10 +1105,17 @@ final_summary() {
     echo -e "${COLOR_BOLD}${COLOR_GREEN}=== Configuracion del nodo '${NODE_NAME}' finalizada ===${COLOR_RESET}"
     echo
     echo "Resumen de red InfiniBand:"
+    echo "  Tarjeta detectada: ${IB_CARD_PRESENT}"
     echo "  Interfaz:        ${IB_IFACE:-no detectada}"
     echo "  IP de este nodo: ${NODE_IB_IP}"
     echo "  Maestro:         ${MASTER_HOSTNAME} (${MASTER_IB_IP})"
     echo "  Recurso NFS:     ${MASTER_HOSTNAME}:${NFS_EXPORT_PATH} -> ${NFS_MOUNT_POINT}"
+    echo
+    echo "Bibliotecas HPC compiladas manualmente:"
+    echo "  UCX:       ${UCX_PREFIX:-no (repositorio)}"
+    echo "  libfabric: ${LIBFABRIC_PREFIX:-no instalado}"
+    echo "  LibXC:     ${LIBXC_PREFIX:-no instalado}"
+    echo "  OpenMPI:   $([[ "${OPENMPI_BUILT_FROM_SOURCE}" == true ]] && echo "${HPC_STACK_PREFIX}/openmpi (compilado)" || echo "repositorio")"
     echo
 
     if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
@@ -944,6 +1173,7 @@ main() {
     run_stage stage_cpu_stability        "Estabilidad de CPU (gobernador/C-states)"
     run_stage stage_memory_limits        "Limites de memoria para RDMA"
     run_stage stage_infiniband_packages  "Paquetes RDMA/InfiniBand"
+    run_stage stage_custom_hpc_libraries "Bibliotecas HPC desde paquetes descargados"
     run_stage stage_ipoib_interface      "Interfaz IPoIB"
     run_stage stage_hosts_file           "/etc/hosts"
     run_stage stage_ssh_keys             "Llaves SSH"
