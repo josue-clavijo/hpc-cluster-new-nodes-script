@@ -145,6 +145,40 @@ archivo o el bloque. Probado contra una corrida real del script: caso
 identico (OK), bloque con una linea inyectada a mano (la detecta y la
 muestra en el diff), y bloque ausente por completo (lo reporta como tal).
 
+## Auditar un nodo existente (`reference/audit-node-config.sh`)
+
+Los nodos que ya estaban en el cluster antes de este script tienen su propia
+configuracion manual y probablemente no coincidan exactamente con lo que deja
+`configure-new-node.sh` en un nodo nuevo. En vez de "resetear" esos nodos de
+una sola pasada (riesgoso si ya estan funcionando bien), `audit-node-config.sh`
+permite comparar su configuracion real contra el estandar del nodo nuevo, de
+solo lectura: **no instala nada, no edita ningun archivo, no reinicia ningun
+servicio.**
+
+```bash
+sudo ./reference/audit-node-config.sh > reporte-nodo3.txt
+```
+
+Revisa usuario/grupo y autologin, estabilidad de Cinnamon (suspension,
+bloqueo, DPMS), gobernador de CPU y parametros de GRUB, limites de memoria
+para RDMA, la pila RDMA/InfiniBand y la interfaz IPoIB, `/etc/hosts`, SSH,
+el montaje NFS y el directorio compartido `cluster-conf/`, el toolchain
+MPI/OpenMP, y el bloque de variables de entorno en `~/.bashrc` (reutilizando
+`check-bashrc-integrity.sh`). Cada linea queda marcada como `[OK]`, `[DIFF]`
+(existe pero con otro valor/contenido), `[MISSING]` (no existe), `[WARN]`
+(no se pudo verificar, o es una diferencia que puede ser normal segun el
+hardware del nodo) o `[INFO]`. Al final imprime un resumen y la lista de
+items `DIFF`/`MISSING`; el codigo de salida es `1` si hubo alguno, `0` si el
+nodo coincide en todo.
+
+Si el nodo nunca corrio este script, usa valores por defecto (`ryzen`/`ryzen`,
+prefijo `/usr/local`, maestro `master`/`10.10.10.1`); se pueden ajustar con
+`--user=`, `--group=`, `--prefix=`, `--master-host=`, `--master-ip=`.
+
+El reporte generado (el `.txt` redirigido arriba) es el punto de partida para
+decidir, nodo por nodo, que diferencias vale la pena armonizar y en que orden,
+en vez de aplicar cambios a ciegas.
+
 ## Requisitos previos
 
 - Linux Mint (o derivado de Ubuntu/Debian) con acceso a internet para
