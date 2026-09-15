@@ -119,6 +119,27 @@ poder reintentar la configuracion desde cero.
 compartido del cluster en el NFS (`cluster-conf/`) — otros nodos pueden
 depender de el.
 
+## Verificar integridad de `~/.bashrc` (`reference/`)
+
+`reference/expected-bashrc-block.sh` es el bloque exacto que
+`stage_bashrc_environment` inserta en `~/.bashrc` (extraido programaticamente
+del propio script, no transcrito a mano), con el prefijo por defecto
+`/usr/local`. Sirve como patron de referencia para detectar ediciones
+manuales, corrupcion, o codigo inyectado despues de que el script termino.
+
+```bash
+sudo ./reference/check-bashrc-integrity.sh [usuario]
+```
+
+Extrae el bloque marcado del `.bashrc` real, ajusta el patron al prefijo
+que de verdad se uso en ese nodo (leido de `/etc/hpc-cluster/node.conf`), y
+muestra un diff si no coincide exactamente. Sin argumento usa el
+`CLUSTER_USER` guardado en `node.conf` (o `ryzen` si no lo encuentra).
+Salida: `0` = coincide, `1` = difiere (revisar el diff), `2` = no existe el
+archivo o el bloque. Probado contra una corrida real del script: caso
+identico (OK), bloque con una linea inyectada a mano (la detecta y la
+muestra en el diff), y bloque ausente por completo (lo reporta como tal).
+
 ## Requisitos previos
 
 - Linux Mint (o derivado de Ubuntu/Debian) con acceso a internet para

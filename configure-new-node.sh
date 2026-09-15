@@ -531,6 +531,7 @@ EOF
         echo "NFS_MOUNT_POINT=${NFS_MOUNT_POINT}"
         echo "CLUSTER_USER=${CLUSTER_USER}"
         echo "CLUSTER_GROUP=${CLUSTER_GROUP}"
+        echo "HPC_INSTALL_PREFIX=${HPC_INSTALL_PREFIX}"
         echo "CONFIGURED_AT=$(date -Is)"
     } > "${STATE_FILE}"
 }
